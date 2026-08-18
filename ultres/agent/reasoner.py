@@ -175,14 +175,23 @@ def two_pass_implement(
 
     # --- Pass 2: Coder model implements from the plan ---
     # Swap to coder model (unloads instruct first to free VRAM).
+    coder = None
+    coder_available = False
     try:
         coder = model_mgr.load_coder()
         coder_available = True
     except Exception as e:
         if streamer and streamer.enabled:
-            streamer.print(f"[yellow]Coder model unavailable ({e}); using Instruct for Pass 2.[/yellow]")
-        coder = model_mgr.load_instruct()
-        coder_available = False
+            streamer.print(f"[yellow]Coder model unavailable ({e}); trying Instruct fallback...[/yellow]")
+        # Try to fall back to Instruct model for Pass 2.
+        try:
+            coder = model_mgr.load_instruct()
+            coder_available = False
+        except Exception as e2:
+            if streamer and streamer.enabled:
+                streamer.print(f"[red]Instruct fallback also failed ({e2}); using plan as answer.[/red]")
+            # Last resort: return the plan as the implementation.
+            return plan, plan
 
     pass2_prompt = (
         f"User request: {user_query}\n\n"

@@ -223,10 +223,28 @@ def _download_multipart(
     """Download multi-part GGUF files (e.g. base-00001-of-00002.gguf).
 
     Returns the path to the first part (llama.cpp loads splits from part 1).
+    Checks local cache first before hitting the network.
     """
     base = base_filename.replace(".gguf", "")
     parts: list[Path] = []
     part_num = 1
+
+    # Phase 1: Check if parts are already on disk (no network needed).
+    for total in range(2, 6):
+        local_parts: list[Path] = []
+        for pn in range(1, total + 1):
+            suffix = f"-{pn:05d}-of-{total:05d}.gguf"
+            filename = f"{base}{suffix}"
+            dest = cache_dir / filename
+            if dest.exists() and dest.stat().st_size > 0:
+                local_parts.append(dest)
+            else:
+                break
+        if local_parts and len(local_parts) == total:
+            console.print(f"[green]Model already present ({total} parts):[/green] {local_parts[0].parent.name}/{local_parts[0].name}")
+            return local_parts[0]
+
+    # Phase 2: Not fully cached — download from network.
     while True:
         # Try patterns: base-00001-of-00002.gguf, base-00001-of-00003.gguf, etc.
         # We don't know the total, so try incrementing part counts.
@@ -330,17 +348,34 @@ def load_llama(
 def unload_model(llm: Any) -> None:
     """Properly free VRAM from a loaded Llama instance.
 
-    Deletes the model object and forces garbage collection + CUDA cache clearing.
-    Needed for dual-model workflows where we swap between Instruct and Coder.
+    Closes the llama.cpp model context, deletes the model object, and forces
+    garbage collection + CUDA cache clearing. Needed for dual-model workflows
+    where we swap between Instruct and Coder on 8GB VRAM.
     """
+    # Explicitly close the model's internal resources (mmap, contexts).
+    try:
+        if hasattr(llm, "close"):
+            llm.close()
+    except Exception:
+        pass
+    # Also try the context manager exit for older llama-cpp-python versions.
+    try:
+        if hasattr(llm, "_stack"):
+            llm._stack.close()
+    except Exception:
+        pass
     del llm
     import gc
 
+    # Run GC twice to ensure all references are collected.
+    gc.collect()
     gc.collect()
     try:
         import torch  # type: ignore[import-not-found]
 
         if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
     except Exception:
         pass
@@ -410,11 +445,23 @@ class ModelManager:
         return self._current
 
     def unload_current(self) -> None:
-        """Unload the currently loaded model and free VRAM."""
+        """Unload the currently loaded model and free VRAM.
+
+        Drops our reference BEFORE calling gc.collect() so the model is
+        actually eligible for collection. Adds a small delay on Windows
+        to let the OS release file handles.
+        """
         if self._current is not None:
-            unload_model(self._current)
+            # Grab a local ref, then drop the manager's reference so
+            # gc.collect() inside unload_model can actually collect it.
+            llm = self._current
             self._current = None
             self._current_key = None
+            unload_model(llm)
+            # Give Windows time to release mmap file handles.
+            if sys.platform == "win32":
+                import time as _time
+                _time.sleep(1.0)
 
     def current(self) -> "Any | None":
         """Return the currently loaded model, or None."""

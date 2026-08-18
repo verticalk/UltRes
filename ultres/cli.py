@@ -31,6 +31,15 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Force UTF-8 output on Windows to avoid cp1252 UnicodeEncodeError with
+# rich's Unicode characters (▶, ✓, █, ░, etc.).
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -53,7 +62,8 @@ app.add_typer(models_app, name="models")
 trajectories_app = typer.Typer(help="Trajectory management for v1.5 QLoRA training.")
 app.add_typer(trajectories_app, name="trajectories")
 
-console = Console()
+# Force UTF-8 console to avoid cp1252 encoding errors on Windows.
+console = Console(force_terminal=True, legacy_windows=False) if sys.platform == "win32" else Console()
 
 # Known subcommand names — if the first CLI arg is NOT one of these, treat all
 # args as a bare query and route to `run`.
