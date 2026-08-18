@@ -2,6 +2,38 @@
 
 Guidance for AI agents (and humans) working on the UltRes codebase.
 
+**Repo:** https://github.com/verticalk/UltRes (private)
+
+## Project status
+
+**v1 — complete and verified.** End-to-end local research agent working.
+
+| Milestone | Status |
+|---|---|
+| Package scaffold + CLI | Done |
+| Config (Pydantic + TOML) | Done |
+| Model registry + loader (GGUF + llama.cpp) | Done |
+| Search layer (SearXNG / Tavily / Brave + fetch) | Done |
+| Memory layer (store / vector / hierarchical / KV cache) | Done |
+| Agent layer (tools / planner / research loop / reasoner) | Done |
+| LoRA cache stub (v1.5/v2) | Done |
+| Tests (31 unit tests) | Done — all passing |
+| End-to-end pipeline verified | Done |
+| Git repo + pushed to GitHub | Done |
+
+**Verified end-to-end:** `ultres "What is the difference between C++ std::vector and std::list?"`
+searched SearXNG, visited 2 cppreference.com pages, extracted 8 code blocks + 2 docs
+into the knowledge store, and produced a research-backed answer in 11 steps.
+
+**Base model:** Qwen2.5-Coder-7B-Instruct Q4_K_M (4.7 GB, Apache 2.0).
+Note: there is no official Qwen3-Coder-7B — the Qwen3-Coder series only ships
+MoE variants (480B-A35B, 30B-A3B, Next). Qwen2.5-Coder-7B is the correct 7B coder model.
+
+**Roadmap:**
+- v1 (done): agent wrapper around stock Qwen2.5-Coder-7B + hierarchical memory
+- v1.5 (next): QLoRA-specialize on UltRes agent trajectories → UltRes-Base-7B (Kaggle free T4)
+- v2: full fine-tune + YaRN long-context extension (32K→256K) → UltRes-Base-7B-Long (cloud GPU credits)
+
 ## Build & install
 
 ```bash
