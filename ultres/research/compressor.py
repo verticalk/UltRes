@@ -9,12 +9,60 @@ Takes clustered pages and produces:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from ultres.research.clusterer import Cluster, rank_code_examples
 from ultres.search.base import CodeBlock
 from ultres.streaming import ResearchStreamer
+
+
+# ---------------------------------------------------------------------------
+# Cluster summary parsing (v1.4: more robust than splitting on "---")
+# ---------------------------------------------------------------------------
+
+_CLUSTER_HEADER_RE = re.compile(
+    r"#{1,4}\s*(?:Cluster\s*)?(\d+)\s*[:\-]?\s*(.*)",
+    re.IGNORECASE,
+)
+
+
+def _parse_cluster_summaries(text: str, expected_count: int) -> list[str]:
+    """Parse model output into per-cluster summaries.
+
+    Tries multiple formats in order:
+    1. Numbered headers: "### Cluster 1: ..." or "### 1. ..."
+    2. "---" separator
+    3. Double-newline paragraphs
+    """
+    # Try numbered headers first.
+    headers = list(_CLUSTER_HEADER_RE.finditer(text))
+    if len(headers) >= expected_count:
+        parts: list[str] = []
+        for i, m in enumerate(headers):
+            start = m.end()
+            end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+            parts.append(text[start:end].strip())
+        return parts
+
+    # Fall back to "---" separator.
+    if "---" in text:
+        parts = text.split("---")
+        # Strip and filter empty.
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) >= expected_count:
+            return parts
+
+    # Fall back to double-newline paragraphs.
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if len(paragraphs) >= expected_count:
+        return paragraphs
+
+    # Last resort: return what we have, padded with empty strings.
+    while len(paragraphs) < expected_count:
+        paragraphs.append("")
+    return paragraphs[:expected_count]
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +125,8 @@ def batch_summarize(
             f"- Best practices mentioned\n"
             f"- For code clusters: note the best code examples and what makes them good\n\n"
             f"{'─' * 60}\n\n".join(cluster_descriptions) + f"\n\n{'─' * 60}\n\n"
-            f"Respond with a summary for each cluster, separated by '---'. "
+            f"Respond with a summary for each cluster. Use this exact format:\n"
+            f"### Cluster 1:\n<summary>\n### Cluster 2:\n<summary>\n"
             f"Keep each summary to 100-200 words."
         )
 
@@ -91,10 +140,14 @@ def batch_summarize(
                 max_tokens=max_tokens,
             )
             text = resp["choices"][0]["message"]["content"].strip()
-            # Split by "---" and assign to clusters.
-            parts = text.split("---")
+            # v1.4: Parse numbered cluster summaries (### Cluster N:) first,
+            # then fall back to "---" separator, then to line-based parsing.
+            parts = _parse_cluster_summaries(text, len(batch))
             for i, c in enumerate(batch):
-                c.summary = parts[i].strip() if i < len(parts) else "No summary."
+                c.summary = parts[i].strip() if i < len(parts) else ""
+                if not c.summary:
+                    # Fallback: use first paragraph of first page.
+                    c.summary = c.pages[0].text[:200] if c.pages else "No summary."
                 # Select best code examples.
                 best = rank_code_examples(c.code_blocks, max_per_cluster=3)
                 c.best_examples = [cb.content[:500] for cb in best]

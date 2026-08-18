@@ -120,6 +120,79 @@ class VectorIndex:
             )
         return hits
 
+    def recall_filtered(
+        self,
+        query: str,
+        k: int = 8,
+        exclude_kinds: set[str] | None = None,
+    ) -> list[RecallHit]:
+        """Recall but filter out chunks whose 'kind' metadata is in exclude_kinds.
+
+        Used to exclude temporary crawl docs from recall results.
+        """
+        if exclude_kinds is None:
+            exclude_kinds = set()
+        # Fetch more than k so we have enough after filtering.
+        fetch_k = min(k * 3, self._collection.count()) if self._collection.count() > 0 else 0
+        if fetch_k == 0:
+            return []
+        res = self._collection.query(
+            query_texts=[query],
+            n_results=fetch_k,
+        )
+        hits: list[RecallHit] = []
+        ids = (res.get("ids") or [[]])[0]
+        docs = (res.get("documents") or [[]])[0]
+        metas = (res.get("metadatas") or [[]])[0]
+        dists = (res.get("distances") or [[]])[0]
+        for cid, doc, meta, dist in zip(ids, docs, metas, dists):
+            kind = (meta or {}).get("kind", "")
+            if kind in exclude_kinds:
+                continue
+            score = 1.0 - float(dist)
+            hits.append(
+                RecallHit(
+                    chunk_id=cid,
+                    text=doc or "",
+                    score=score,
+                    metadata=meta or {},
+                )
+            )
+            if len(hits) >= k:
+                break
+        return hits
+
+    def delete_by_kind(self, kind: str) -> int:
+        """Delete all chunks with the given 'kind' metadata value.
+
+        Used to clean up temporary crawl docs after clustering.
+        Returns the number of deleted chunks.
+        """
+        try:
+            # Get all IDs with this kind.
+            results = self._collection.get(where={"kind": kind})
+            ids = results.get("ids", [])
+            if ids:
+                self._collection.delete(ids=ids)
+            return len(ids)
+        except Exception:
+            return 0
+
+    def delete_by_id_prefix(self, prefix: str) -> int:
+        """Delete all chunks whose ID starts with the given prefix.
+
+        Used to clean up temporary crawl docs (IDs like 'crawl:...').
+        """
+        try:
+            results = self._collection.get()
+            ids = results.get("ids", [])
+            to_delete = [i for i in ids if i.startswith(prefix)]
+            if to_delete:
+                self._collection.delete(ids=to_delete)
+            return len(to_delete)
+        except Exception:
+            return 0
+
     # -- lifecycle -----------------------------------------------------
 
     def count(self) -> int:

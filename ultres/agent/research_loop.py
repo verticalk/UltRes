@@ -410,25 +410,35 @@ def _save_trajectory(
     visited_urls: list[str],
     doc_ids: list[str],
     code_ids: list[str],
+    query_type: str = "general",
 ) -> None:
-    """Save a research trajectory to .ultres/trajectories/ for v1.5 QLoRA training."""
-    import json as _json
+    """Save a research trajectory in the unified v1.4 format.
 
+    Both fast and deep modes use the same schema for v1.5 QLoRA compatibility.
+    """
     traj_dir = cfg.ultres_dir / "trajectories"
     traj_dir.mkdir(parents=True, exist_ok=True)
     traj_path = traj_dir / f"{query_id}.jsonl"
     record = {
         "query_id": query_id,
         "query": user_query,
+        "mode": "fast",  # fast agentic loop
+        "query_type": query_type,
         "answer": answer,
+        "plan": None,  # fast mode has no Pass 1 plan
+        "brief": None,  # fast mode has no master brief
         "steps": steps,
+        "pages_crawled": len(visited_urls),  # fast mode: pages = visited URLs
+        "clusters": None,
+        "gaps": None,
         "visited_urls": visited_urls,
         "doc_ids": doc_ids,
         "code_ids": code_ids,
+        "timing": {},
         "timestamp": time.time(),
     }
     with traj_path.open("w", encoding="utf-8") as f:
-        f.write(_json.dumps(record) + "\n")
+        f.write(json.dumps(record) + "\n")
 
 
 async def run_research_loop(
@@ -648,7 +658,10 @@ async def run_research_loop(
     # --- Save trajectory for v1.5 QLoRA training ---
     doc_ids = list(store.meta.docs.keys())
     code_ids = list(store.meta.code.keys())
-    _save_trajectory(cfg, query_id, user_query, answer, steps, visited_urls, doc_ids, code_ids)
+    # Detect query type for trajectory metadata.
+    from ultres.research.source_prioritizer import detect_query_type as _detect_qt
+    qt = _detect_qt(user_query)
+    _save_trajectory(cfg, query_id, user_query, answer, steps, visited_urls, doc_ids, code_ids, query_type=qt)
 
     # Persist answer.
     answer_path = cfg.answers_dir / f"{query_id}.md"

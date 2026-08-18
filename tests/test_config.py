@@ -6,6 +6,12 @@ import os
 from pathlib import Path
 
 from ultres.config import UltResConfig
+from ultres import __version__
+
+
+def test_version():
+    """Version should be 1.4.0 for this release."""
+    assert __version__ == "1.4.0"
 
 
 def test_default_config(tmp_path: Path):
@@ -46,3 +52,11 @@ def test_ensure_dirs(tmp_path: Path):
     assert cfg.index_dir.exists()
     assert cfg.answers_dir.exists()
     assert cfg.adapters_dir.exists()
+
+
+def test_deep_research_config_defaults(tmp_path: Path):
+    """v1.4: pipeline_timeout_min should have a default."""
+    cfg = UltResConfig(project_dir=tmp_path)
+    assert cfg.deep_research.pipeline_timeout_min == 90
+    assert cfg.deep_research.max_pages == 2000
+    assert cfg.deep_research.enable_two_pass is True

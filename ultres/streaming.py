@@ -91,7 +91,11 @@ class ResearchStreamer:
             self.console.print(f"[cyan]▶ {label}...[/cyan]")
 
     def stage_progress(self, name: str, current: int, total: int, detail: str = "") -> None:
-        """Update progress for a stage."""
+        """Update progress for a stage.
+
+        v1.4: Uses console.print with a progress bar instead of \\r-based
+        rendering, which was causing display issues in some terminals.
+        """
         info = self._stage_map.get(name)
         if not info:
             return
@@ -101,9 +105,12 @@ class ResearchStreamer:
         if self.enabled and total > 0:
             pct = current * 100 // total
             bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+            # Use a simple print with the progress info.
+            # We don't use \r because it conflicts with rich's Live display.
+            # Instead, print a dim progress line that gets overwritten by the
+            # next stage_done or stage_progress call.
             self.console.print(
-                f"\r[dim]  {bar} {current}/{total} {detail}[/dim]",
-                end="",
+                f"  [dim]{bar} {current}/{total} {detail}[/dim]",
             )
 
     def stage_done(self, name: str, stats: dict[str, Any] | None = None) -> None:
@@ -117,7 +124,6 @@ class ResearchStreamer:
             info.stats.update(stats)
         self._current = None
         if self.enabled:
-            self.console.print()  # newline after progress
             stat_str = " | ".join(f"{k}={v}" for k, v in (stats or {}).items())
             self.console.print(
                 f"[green]✓ {info.label}[/green] "

@@ -12,7 +12,7 @@ Guidance for AI agents (and humans) working on the UltRes codebase.
 
 ## Project status
 
-**v1.2 — Deep research pipeline with bulk crawl, gap detection, two-pass implementation, and live streaming.**
+**v1.4 — Bug fixes, optimization, and v1.5 readiness. Fixes critical bugs (model lifecycle crash, Playwright memory exhaustion, missing disk persistence), adds per-domain rate limiting, graceful cancellation, unified trajectory format, and training-ready export.**
 
 | Milestone | Status |
 |---|---|
@@ -28,33 +28,48 @@ Guidance for AI agents (and humans) working on the UltRes codebase.
 | Synthesis pass (evidence-cited answers) | Done |
 | Self-critique loop (reasoning about reasoning) | Done |
 | Trajectory saving for v1.5 QLoRA | Done |
-| **v1.2: Deep research pipeline (bulk crawl 2000+ pages)** | **Done** |
-| **v1.2: Query expansion (90-250 search queries)** | **Done** |
-| **v1.2: Source prioritizer (GitHub/SO/cppreference for code)** | **Done** |
-| **v1.2: Vector clustering + TF-IDF labeling** | **Done** |
-| **v1.2: Gap detection + multi-round re-crawl** | **Done** |
-| **v1.2: Batch summarize + hierarchical compression** | **Done** |
-| **v1.2: Two-pass implementation (Instruct plan → Coder code)** | **Done** |
-| **v1.2: Live streaming with per-stage timers** | **Done** |
-| **v1.2: 64K context via YaRN (verified working)** | **Done** |
-| **v1.2: Dual model loading (load/unload Instruct ↔ Coder)** | **Done** |
-| Tests (54 unit tests) | Done — all passing |
-| End-to-end pipeline verified | Done |
+| v1.2: Deep research pipeline (bulk crawl 2000+ pages) | Done |
+| v1.2: Query expansion (90-250 search queries) | Done |
+| v1.2: Source prioritizer (GitHub/SO/cppreference for code) | Done |
+| v1.2: Vector clustering + TF-IDF labeling | Done |
+| v1.2: Gap detection + multi-round re-crawl | Done |
+| v1.2: Batch summarize + hierarchical compression | Done |
+| v1.2: Two-pass implementation (Instruct plan → Coder code) | Done |
+| v1.2: Live streaming with per-stage timers | Done |
+| v1.2: 64K context via YaRN (verified working) | Done |
+| **v1.4: ModelManager (fixes dual-model crash on 8GB VRAM)** | **Done** |
+| **v1.4: httpx-first fetch (10x faster, no Chromium spam)** | **Done** |
+| **v1.4: Pages persisted to disk KnowledgeStore in deep mode** | **Done** |
+| **v1.4: Per-domain rate limiting (max 3 concurrent/domain)** | **Done** |
+| **v1.4: Graceful Ctrl+C cancellation with partial save** | **Done** |
+| **v1.4: Unified trajectory format (fast + deep)** | **Done** |
+| **v1.4: Training-ready export (`ultres trajectories export`)** | **Done** |
+| **v1.4: Trajectory validation + statistics** | **Done** |
+| **v1.4: Pipeline timeout (configurable, default 90 min)** | **Done** |
+| **v1.4: Fixed 10 critical bugs from v1.2** | **Done** |
+| Tests (76 unit tests) | Done — all passing |
 | Git repo + pushed to GitHub | Done |
 
-**v1.2 changes from v1.1:**
-- **Deep research pipeline**: Default mode now crawls 2000+ pages per query (was ~10).
-- **Query expansion**: 30-50 subtasks × 3-5 variations = 90-250 search queries.
-- **Source prioritization**: Code queries prioritize GitHub, Stack Overflow, cppreference.
-- **Quality filtering**: Pages scored and filtered by relevance, content, code blocks.
-- **Clustering**: Vector clustering into 50-200 topic clusters with TF-IDF labels.
-- **Gap detection**: Model reviews coverage, identifies missing topics, re-crawls for gaps.
-- **Batch summarize**: 5 clusters per model call, hierarchical compression into master brief.
-- **Two-pass implementation**: Instruct model writes plan from research, Coder model implements from plan. Coder is FORCED to follow research, not pretrained knowledge.
-- **Live streaming**: Per-stage timers, progress bars, token-by-token streaming for implementation.
-- **64K context**: YaRN rope scaling (verified working on RTX 4060 Ti 8GB).
-- **Dual model loading**: Sequential load/unload of Instruct and Coder models to fit 8GB VRAM.
-- **Fast mode**: `--fast` flag runs the v1.1 agentic loop for quick queries.
+**v1.4 changes from v1.2:**
+- **Fixed: Model lifecycle crash** — CLI loaded both models into 8GB VRAM. New `ModelManager` class swaps models at pipeline stage boundaries.
+- **Fixed: Playwright memory exhaustion** — Crawler now uses httpx-first with Playwright fallback (10x faster, no browser spam for 2000+ pages).
+- **Fixed: Pages not persisted to disk** — Deep mode now ingests crawled pages into KnowledgeStore + VectorIndex as they're fetched.
+- **Fixed: Stage name mismatch** — Crawler progress updates were silently failing. Now parameterized.
+- **Fixed: Empty crawl not handled** — Pipeline returns graceful error instead of producing garbage.
+- **Fixed: Clusterer index pollution** — Crawl docs are cleaned up after clustering.
+- **Fixed: Weak critique logic** — Now properly extracts code blocks from critique, doesn't replace with raw prose.
+- **Fixed: Pass 1 plan not saved** — Trajectory now includes both plan and implementation.
+- **Fixed: Version strings outdated** — Bumped to 1.4.0, added `__version__`.
+- **Fixed: CLI docstring outdated** — Updated to match actual flags.
+- **Added: Per-domain rate limiting** — Max 3 concurrent fetches per domain.
+- **Added: Graceful cancellation** — Ctrl+C saves partial results.
+- **Added: Pipeline timeout** — Configurable, default 90 min.
+- **Added: Unified trajectory format** — Both fast and deep modes use the same schema.
+- **Added: Training-ready export** — `ultres trajectories export --output train.jsonl`.
+- **Added: Trajectory validation + statistics** — `ultres trajectories validate` and `ultres trajectories stats`.
+- **Improved: Query type detection** — Removed overly generic keywords ("app", "calculator", etc.).
+- **Improved: Batch summarize parsing** — Uses numbered headers instead of "---" separator.
+- **Improved: CLI** — `ultres list` shows both fast and deep queries. `ultres show` shows plan + brief. `ultres clean` also cleans trajectories.
 
 **Base model:** Qwen2.5-7B-Instruct Q4_K_M (4.7 GB, Apache 2.0, 64K context via YaRN).
 General-purpose instruct model with native function-calling support.
@@ -62,6 +77,7 @@ Coder model: Qwen2.5-Coder-7B-Instruct (used for implementation pass in two-pass
 
 **Roadmap:**
 - v1.2 (done): Deep research pipeline + 64K context + two-pass + streaming + gap detection
+- v1.4 (done): Bug fixes, optimization, v1.5 readiness (unified trajectories, export, validation)
 - v1.5 (next): QLoRA-specialize on accumulated UltRes trajectories → UltRes-Base-7B (Kaggle free T4)
 - v2: full fine-tune + YaRN long-context extension (64K→256K) → UltRes-Base-7B-Long (cloud GPU credits)
 
@@ -84,13 +100,15 @@ playwright install chromium # for the page fetcher
 ## Test
 
 ```bash
-pytest                      # unit tests in tests/ (54 tests, no GPU/model needed)
+pytest                      # unit tests in tests/ (76 tests, no GPU/model needed)
 ```
 
 Tests cover: store CRUD, hierarchical summary tree, vector recall, tool-call
 JSON parsing (native + fallback), config TOML round-trip, LoRA cache stub,
-trajectory save/load, streaming, source prioritizer, clusterer, gap detector,
-compressor. They do NOT require a GPU, downloaded model, or network access.
+trajectory save/load/export/validate/stats, streaming, source prioritizer,
+clusterer, gap detector, compressor, pipeline critique logic, domain rate
+limiting, unified trajectory format. They do NOT require a GPU, downloaded
+model, or network access.
 
 ## Run
 
@@ -118,16 +136,20 @@ Requires a running SearXNG instance (see README) or a Tavily/Brave API key.
 
 ## Verified working
 
-- **54/54 tests pass** on Python 3.12.8, Windows 11.
+- **76/76 tests pass** on Python 3.12.8, Windows 11.
 - **GPU**: RTX 4060 Ti 8GB, CUDA 12.1 wheel, **43.6 tokens/sec**.
 - **Model**: Qwen2.5-7B-Instruct Q4_K_M (4.7 GB, multi-part GGUF, 64K via YaRN).
 - **Context**: 64K via YaRN verified working (128K fails — KV cache too large).
 - **Native tool calling**: Qwen2.5-7B-Instruct uses `tools=` API parameter.
 - **Search**: SearXNG in Docker with JSON format + limiter disabled.
 - **Deep pipeline**: 10-stage pipeline with bulk crawl, clustering, gap detection, two-pass implementation.
+- **ModelManager**: Sequential model loading/unloading (Instruct for stages 1-7+9, Coder for stage 8).
+- **httpx-first fetch**: 10x faster than Playwright for bulk crawl, with Playwright fallback.
+- **Disk persistence**: Deep mode pages ingested into KnowledgeStore + VectorIndex.
 - **Live streaming**: Per-stage timers, progress bars, token-by-token streaming.
-- **Self-critique**: After implementation, answer is critiqued against research.
-- **Trajectories**: Saved to `.ultres/trajectories/` with timing data for v1.5 QLoRA.
+- **Self-critique**: After implementation, answer is critiqued against research (extracts code blocks only).
+- **Trajectories**: Unified format (fast + deep), saved to `.ultres/trajectories/` for v1.5 QLoRA.
+- **Trajectory export**: `ultres trajectories export --output train.jsonl` produces training-ready JSONL.
 
 ## Architecture (one-paragraph)
 
@@ -148,12 +170,14 @@ streaming** with per-stage timers.
 
 ## Key constraints
 
-- **v1.2 ships no training.** The `lora/` module is a loader stub + trajectory accumulator. Training is v1.5.
-- **v1.2 uses Qwen2.5-7B-Instruct** (64K via YaRN, native tool calling). Coder model: Qwen2.5-Coder-7B for implementation pass.
+- **v1.4 ships no training.** The `lora/` module is a loader stub + trajectory accumulator + export. Training is v1.5.
+- **v1.4 uses Qwen2.5-7B-Instruct** (64K via YaRN, native tool calling). Coder model: Qwen2.5-Coder-7B for implementation pass.
 - **64K context via YaRN** (verified). 128K fails — KV cache too large for 8GB VRAM + 16GB RAM.
 - **GPU requires CUDA 12.1 wheel** (v0.3.4). CPU wheel works as fallback.
-- **Deep pipeline takes 40-60 min** per query. Use `--fast` for quick queries.
-- **Dual model loading**: 8GB VRAM can't hold both models. Sequential load/unload.
+- **Deep pipeline takes 40-60 min** per query. Use `--fast` for quick queries. Pipeline timeout default 90 min.
+- **ModelManager**: 8GB VRAM can't hold both models. Sequential load/unload via ModelManager.
+- **httpx-first fetch**: Bulk crawl uses httpx (10x faster), falls back to Playwright for JS-heavy sites.
+- **Per-domain rate limiting**: Max 3 concurrent fetches per domain to avoid hammering sites.
 - **KV-cache reuse is best-effort.** v2 wires in real persistence.
 - **Self-critique adds latency**. Disable via `--no-critique`.
 
@@ -162,19 +186,23 @@ streaming** with per-stage timers.
 Goal: produce `UltRes-Base-7B` via QLoRA on UltRes agent trajectories.
 
 1. **Trajectories accumulate automatically** in `.ultres/trajectories/` as
-   JSONL files (query → plan → tool calls → answer → doc_ids → code_ids).
-   Run v1.1 on a curated set of coding/research tasks to build the dataset.
-   Target ~5-10K examples. Use `ultres.lora.cache.list_trajectories()` to
-   inspect the accumulated data.
-2. **Upload as a Kaggle dataset** (CPU session, internet on).
-3. **Train on Kaggle T4×2** (GPU session, internet off):
+   JSONL files (unified v1.4 format: query → mode → plan → answer → brief →
+   pages → clusters → gaps → visited_urls → doc_ids → code_ids → timing).
+   Run v1.4 on a curated set of coding/research tasks to build the dataset.
+   Target ~5-10K examples.
+2. **Export training data**: `ultres trajectories export --output train.jsonl`
+   produces instruction/response pairs with research context. Use
+   `ultres trajectories stats` to check dataset size and
+   `ultres trajectories validate` to check quality.
+3. **Upload as a Kaggle dataset** (CPU session, internet on).
+4. **Train on Kaggle T4×2** (GPU session, internet off):
    - Base: `unsloth/qwen2.5-7b-instruct-bnb-4bit` (general reasoning model)
    - LoRA rank 32, alpha 64, all linear layers
    - Max seq len 4096, batch 2, grad accum 4, 3 epochs, LR 2e-4 cosine
    - Use Unsloth's official Kaggle T4×2 notebooks as the template.
-4. **Merge + convert to GGUF** (Q4_K_M, Q8_0) via llama.cpp.
-5. **Publish** to HuggingFace as `ultres/UltRes-Base-7B-GGUF`.
-6. **Pin** the repo URL + sha256 in `ultres/models/registry.py`.
+5. **Merge + convert to GGUF** (Q4_K_M, Q8_0) via llama.cpp.
+6. **Publish** to HuggingFace as `ultres/UltRes-Base-7B-GGUF`.
+7. **Pin** the repo URL + sha256 in `ultres/models/registry.py`.
 
 ## v2 training (Vultr $250 free A100 80GB, ~68 hrs)
 

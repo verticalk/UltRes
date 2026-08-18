@@ -356,6 +356,76 @@ def load_coder_model(cfg: UltResConfig) -> "Any":
     return load_llama(cfg, spec=spec, model_path=model_path)
 
 
+class ModelManager:
+    """Manages sequential model loading/unloading for dual-model workflows.
+
+    On 8GB VRAM, only one 7B model can be loaded at a time. This manager
+    ensures the correct model is loaded for each pipeline stage and the
+    previous model is unloaded before loading the next.
+
+    Usage:
+        mgr = ModelManager(cfg)
+        llm = mgr.load_instruct()   # stages 1-7
+        mgr.unload_current()
+        coder = mgr.load_coder()    # stage 8 pass 2
+        mgr.unload_current()
+        llm = mgr.load_instruct()   # stage 9
+    """
+
+    def __init__(self, cfg: UltResConfig):
+        self.cfg = cfg
+        self._current: Any = None
+        self._current_key: str | None = None
+        self._instruct_path: Path | None = None
+        self._coder_path: Path | None = None
+        self._instruct_spec = None
+        self._coder_spec = None
+
+    def load_instruct(self) -> "Any":
+        """Load the Instruct model, unloading any currently loaded model first."""
+        if self._current_key == "instruct" and self._current is not None:
+            return self._current
+        self.unload_current()
+        if self._instruct_path is None:
+            self._instruct_spec = resolve_spec(self.cfg)
+            self._instruct_path = download_model(
+                self._instruct_spec, self.cfg.model.quant, self.cfg.model_cache_dir
+            )
+        self._current = load_llama(self.cfg, spec=self._instruct_spec, model_path=self._instruct_path)
+        self._current_key = "instruct"
+        return self._current
+
+    def load_coder(self) -> "Any":
+        """Load the Coder model, unloading any currently loaded model first."""
+        if self._current_key == "coder" and self._current is not None:
+            return self._current
+        self.unload_current()
+        if self._coder_path is None:
+            self._coder_spec = get_spec(self.cfg.deep_research.coder_model)
+            self._coder_path = download_model(
+                self._coder_spec, self.cfg.model.quant, self.cfg.model_cache_dir
+            )
+        self._current = load_llama(self.cfg, spec=self._coder_spec, model_path=self._coder_path)
+        self._current_key = "coder"
+        return self._current
+
+    def unload_current(self) -> None:
+        """Unload the currently loaded model and free VRAM."""
+        if self._current is not None:
+            unload_model(self._current)
+            self._current = None
+            self._current_key = None
+
+    def current(self) -> "Any | None":
+        """Return the currently loaded model, or None."""
+        return self._current
+
+    @property
+    def current_key(self) -> str | None:
+        """Return the key of the currently loaded model ('instruct' or 'coder')."""
+        return self._current_key
+
+
 def resolve_spec(cfg: UltResConfig) -> ModelSpec:
     """Return the ModelSpec matching the config's model selection."""
     return get_spec(cfg.model.selection)

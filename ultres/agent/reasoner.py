@@ -109,25 +109,26 @@ and proper structure as specified in the plan.
 
 
 def two_pass_implement(
-    llm_instruct: Any,
-    llm_coder: Any | None,
+    model_mgr: Any,
     user_query: str,
     brief: MasterBrief,
     streamer: ResearchStreamer | None = None,
     temperature: float = 0.4,
-) -> str:
+) -> tuple[str, str]:
     """Two-pass implementation: Instruct writes plan, Coder implements.
 
+    Uses the ModelManager to swap between models, ensuring only one is
+    loaded at a time (required for 8GB VRAM).
+
     Args:
-        llm_instruct: Instruct model for planning (Pass 1).
-        llm_coder: Coder model for implementation (Pass 2). If None, uses llm_instruct.
+        model_mgr: ModelManager instance for loading/unloading models.
         user_query: The user's original request.
         brief: Master research brief with code examples.
         streamer: Optional streamer for live token display.
         temperature: Generation temperature.
 
     Returns:
-        The final implementation (code).
+        Tuple of (plan, implementation) strings.
     """
     # Build code examples text.
     code_text = "\n\n---\n\n".join(
@@ -136,6 +137,8 @@ def two_pass_implement(
     )
 
     # --- Pass 1: Instruct model writes the plan ---
+    llm_instruct = model_mgr.load_instruct()
+
     pass1_prompt = (
         f"User request: {user_query}\n\n"
         f"Master research brief ({brief.total_pages} pages, "
@@ -171,7 +174,16 @@ def two_pass_implement(
         plan = resp["choices"][0]["message"]["content"].strip()
 
     # --- Pass 2: Coder model implements from the plan ---
-    coder = llm_coder or llm_instruct
+    # Swap to coder model (unloads instruct first to free VRAM).
+    try:
+        coder = model_mgr.load_coder()
+        coder_available = True
+    except Exception as e:
+        if streamer and streamer.enabled:
+            streamer.print(f"[yellow]Coder model unavailable ({e}); using Instruct for Pass 2.[/yellow]")
+        coder = model_mgr.load_instruct()
+        coder_available = False
+
     pass2_prompt = (
         f"User request: {user_query}\n\n"
         f"Implementation plan (derived from research — FOLLOW THIS):\n\n{plan}\n\n"
@@ -181,7 +193,8 @@ def two_pass_implement(
     )
 
     if streamer and streamer.enabled:
-        streamer.print("\n[bold cyan]Pass 2: Implementing from plan (Coder model)...[/bold cyan]")
+        model_label = "Coder model" if coder_available else "Instruct model (fallback)"
+        streamer.print(f"\n[bold cyan]Pass 2: Implementing from plan ({model_label})...[/bold cyan]")
 
     if streamer and streamer.enabled:
         implementation = streamer.token_stream(
@@ -204,4 +217,4 @@ def two_pass_implement(
         )
         implementation = resp["choices"][0]["message"]["content"].strip()
 
-    return implementation
+    return plan, implementation

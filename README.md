@@ -2,7 +2,7 @@
 
 **UltRes** is a lightweight, locally-runnable AI that performs like a flagship model on a user's specific request by aggressively researching the web, building a disk-backed knowledge store for that exact task, and reasoning over it with a small agentic model — cheap, private, and dynamic.
 
-The base model is a custom fine-tuned + long-context-extended derivative of [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF) (Apache 2.0), built using only free GPU compute. v1.2 ships as a deep research pipeline wrapping the stock model with bulk crawling, gap detection, two-pass implementation, and live streaming; v1.5/v2 add the custom UltRes checkpoints trained on accumulated agent trajectories.
+The base model is a custom fine-tuned + long-context-extended derivative of [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF) (Apache 2.0), built using only free GPU compute. v1.4 ships as a deep research pipeline wrapping the stock model with bulk crawling (httpx-first), gap detection, two-pass implementation, live streaming, and v1.5-ready trajectory export; v1.5/v2 add the custom UltRes checkpoints trained on accumulated agent trajectories.
 
 ## Why UltRes
 
@@ -102,9 +102,16 @@ ultres config
 
 # Clean all stored data (keeps models + config)
 ultres clean
+
+# v1.5 QLoRA training prep:
+ultres trajectories list          # list all saved trajectories
+ultres trajectories stats         # show dataset statistics
+ultres trajectories export -o train.jsonl  # export training-ready JSONL
+ultres trajectories validate      # check trajectory quality
+ultres trajectories show <id>     # show a single trajectory in detail
 ```
 
-## Hardware requirements (v1.2)
+## Hardware requirements (v1.4)
 
 - **CPU:** modern multi-core (tested on i7-13700K)
 - **RAM:** 16 GB minimum (model ~4.7 GB + KV cache for 64K context + OS)
@@ -132,7 +139,8 @@ This is the [MemGPT/Letta](https://github.com/cpacker/MemGPT) pattern + the DR-V
 
 | Phase | What | Compute |
 |---|---|---|
-| **v1.2** (this release) | Deep research pipeline: bulk crawl 2000+ pages, gap detection, two-pass Instruct→Coder implementation, live streaming, 64K YaRN context | Your hardware (no training) |
+| **v1.2** | Deep research pipeline: bulk crawl 2000+ pages, gap detection, two-pass Instruct→Coder implementation, live streaming, 64K YaRN context | Your hardware (no training) |
+| **v1.4** (this release) | Bug fixes, optimization, v1.5 readiness: ModelManager, httpx-first fetch, disk persistence, unified trajectories, training-ready export | Your hardware (no training) |
 | **v1.5** | QLoRA-specialize Qwen2.5-7B-Instruct on accumulated UltRes agent trajectories → `UltRes-Base-7B` | Kaggle free T4×2 (30 hrs/week) |
 | **v2** | Full fine-tune + YaRN long-context extension (64K→256K) → `UltRes-Base-7B-Long` + per-project LoRA cache training | Vultr $250 free A100 80GB credits (~68 hrs) |
 | Future | Continued pretraining; UltRes Lite (4B); shared adapter hub | NVIDIA Inception credits (optional) |
@@ -154,7 +162,7 @@ ultres/
     searxng.py           # Local SearXNG provider
     tavily.py            # Tavily API provider
     brave.py             # Brave API provider
-    fetch.py             # Playwright + trafilatura page extraction
+    fetch.py             # httpx-first + Playwright fallback page extraction
   memory/
     store.py             # Disk knowledge store (raw/notes/summaries/code)
     vector.py            # Chroma in-process index

@@ -1,19 +1,26 @@
 """UltRes CLI (Typer).
 
 Commands:
-    ultres "<query>"                Run the full research pipeline.
+    ultres "<query>"                Run the deep research pipeline (default).
+    ultres --fast "<query>"         Run the fast agentic loop (30 steps).
     ultres models pull              Download the active model.
     ultres models list              List supported models.
     ultres config                   Show / edit config.
     ultres list                     List past queries.
     ultres show <query-id>          Print a past answer + research tree.
-    ultres clean                    Remove all stored queries + index.
+    ultres trajectories list        List saved trajectories.
+    ultres trajectories stats       Show trajectory statistics.
+    ultres trajectories export      Export training-ready JSONL.
+    ultres trajectories validate    Check trajectory completeness.
+    ultres clean                    Remove all stored data (keeps models + config).
 
 Flags:
-    --deep                          max_steps=100
+    --fast                          Use fast agentic loop instead of deep pipeline.
     --search searxng|tavily|brave   Override search backend for this run.
-    --model stock|ultres-base|...   Override model selection for this run.
-    --lite                          (reserved for future 4B tier; not in v1)
+    --model stock|coder|ultres-base|...   Override model selection for this run.
+    --max-pages N                   Max pages to crawl (deep mode, default 2000).
+    --no-critique                   Skip self-critique pass.
+    --no-stream                     Disable live streaming output.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ from rich.text import Text
 from ultres.config import UltResConfig
 from ultres.models.loader import detect_ram_gb, detect_vram_gb, download_model, ensure_model, resolve_spec
 from ultres.models.registry import list_specs
+from ultres import __version__
 
 app = typer.Typer(
     help="UltRes — lightweight self-researching local LLM.",
@@ -42,12 +50,14 @@ app = typer.Typer(
 )
 models_app = typer.Typer(help="Model management.")
 app.add_typer(models_app, name="models")
+trajectories_app = typer.Typer(help="Trajectory management for v1.5 QLoRA training.")
+app.add_typer(trajectories_app, name="trajectories")
 
 console = Console()
 
 # Known subcommand names — if the first CLI arg is NOT one of these, treat all
 # args as a bare query and route to `run`.
-_KNOWN_SUBCOMMANDS = {"run", "models", "config", "list", "show", "clean"}
+_KNOWN_SUBCOMMANDS = {"run", "models", "config", "list", "show", "clean", "trajectories"}
 
 
 def _maybe_redirect_to_run():
@@ -107,7 +117,7 @@ def run(
     mode = "fast agentic" if fast else "deep research"
     console.print(
         Panel(
-            f"[bold]UltRes v1.2[/bold]\n"
+            f"[bold]UltRes v{__version__}[/bold]\n"
             f"Mode: {mode}\n"
             f"Model: {spec.label} ({cfg.model.quant})\n"
             f"Context: {cfg.model.extended_ctx if cfg.model.use_extended_context else spec.native_ctx} tokens\n"
@@ -126,7 +136,7 @@ def run(
     console.print(f"[green]Model:[/green] {model_path}")
 
     # Lazy import to avoid loading llama-cpp-python on every command.
-    from ultres.models.loader import load_llama, load_coder_model, unload_model
+    from ultres.models.loader import ModelManager
     from ultres.search.base import get_provider
 
     # Provider.
@@ -145,7 +155,8 @@ def run(
         from ultres.agent.reasoner import stream_answer
 
         console.print("[cyan]Loading model into llama.cpp...[/cyan]")
-        llm = load_llama(cfg, spec=spec, model_path=model_path)
+        model_mgr = ModelManager(cfg)
+        llm = model_mgr.load_instruct()
         console.print("[green]Model loaded.[/green]")
 
         result = asyncio.run(run_research_loop(llm, cfg, query, provider=provider, console=console))
@@ -156,41 +167,18 @@ def run(
             f"\n[dim]query_id={result.query_id} | steps={result.steps} | "
             f"sources={len(result.visited_urls)}[/dim]"
         )
+        model_mgr.unload_current()
     else:
-        # --- Deep mode: v1.2 deep research pipeline ---
+        # --- Deep mode: v1.4 deep research pipeline ---
         from ultres.research.pipeline import run_deep_research
         from ultres.streaming import ResearchStreamer
 
-        console.print("[cyan]Loading Instruct model into llama.cpp...[/cyan]")
-        llm = load_llama(cfg, spec=spec, model_path=model_path)
-        console.print("[green]Instruct model loaded.[/green]")
-
-        # Try to load coder model for two-pass implementation.
-        llm_coder = None
-        if cfg.deep_research.enable_two_pass:
-            try:
-                console.print("[cyan]Loading Coder model for implementation pass...[/cyan]")
-                # Unload instruct first to free VRAM.
-                unload_model(llm)
-                llm_coder = load_coder_model(cfg)
-                console.print("[green]Coder model loaded.[/green]")
-                # Reload instruct for research stages.
-                console.print("[cyan]Reloading Instruct model for research stages...[/cyan]")
-                llm = load_llama(cfg, spec=spec, model_path=model_path)
-                console.print("[green]Instruct model reloaded.[/green]")
-            except Exception as e:
-                console.print(f"[yellow]Coder model unavailable ({e}); using Instruct for both passes.[/yellow]")
-                llm_coder = None
-                try:
-                    llm = load_llama(cfg, spec=spec, model_path=model_path)
-                except Exception:
-                    pass  # llm might still be loaded
+        model_mgr = ModelManager(cfg)
 
         streamer = ResearchStreamer(console=console, enabled=cfg.deep_research.enable_streaming)
 
         result = asyncio.run(run_deep_research(
-            llm=llm,
-            llm_coder=llm_coder,
+            model_mgr=model_mgr,
             cfg=cfg,
             user_query=query,
             provider=provider,
@@ -203,6 +191,7 @@ def run(
             f"\n[dim]query_id={result.query_id} | pages={result.pages_crawled} | "
             f"clusters={result.clusters_found} | sources={len(result.visited_urls)}[/dim]"
         )
+        model_mgr.unload_current()
 
 
 # Default command: `ultres "query"` (no subcommand).
@@ -248,13 +237,16 @@ def models_list():
     table.add_column("label")
     table.add_column("params", justify="right")
     table.add_column("native ctx", justify="right")
+    table.add_column("ext ctx", justify="right")
     table.add_column("default quant")
     for key, spec in list_specs().items():
+        ext_ctx = spec.extended_ctx if hasattr(spec, "extended_ctx") and spec.extended_ctx else "-"
         table.add_row(
             key,
             spec.label,
             f"{spec.params_b}B",
             f"{spec.native_ctx:,}",
+            f"{ext_ctx:,}" if isinstance(ext_ctx, int) else ext_ctx,
             spec.default_quant,
         )
     console.print(table)
@@ -274,7 +266,11 @@ def config_cmd():
         "Edit field",
         choices=["search.backend", "search.searxng_base_url", "search.tavily_api_key",
                  "search.brave_api_key", "model.selection", "model.quant",
-                 "agent.max_steps", "agent.hot_window_token_budget", "save", "quit"],
+                 "agent.max_steps", "agent.hot_window_token_budget",
+                 "deep_research.max_pages", "deep_research.crawl_concurrency",
+                 "deep_research.enable_two_pass", "deep_research.enable_gap_detection",
+                 "deep_research.gap_research_rounds", "deep_research.pipeline_timeout_min",
+                 "save", "quit"],
         default="quit",
     )
     if field == "quit":
@@ -308,54 +304,103 @@ def config_cmd():
 
 @app.command("list")
 def list_queries():
-    """List past research queries in this project."""
+    """List past research queries in this project (fast + deep mode)."""
     cfg = UltResConfig.load()
-    if not cfg.store_dir.exists():
-        console.print("[dim]No queries yet.[/dim]")
-        return
     table = Table(title="Past queries")
     table.add_column("query_id", style="cyan")
+    table.add_column("mode")
     table.add_column("query")
-    table.add_column("docs", justify="right")
+    table.add_column("docs/pages", justify="right")
     table.add_column("code", justify="right")
-    for qdir in sorted(cfg.store_dir.iterdir()):
-        if not qdir.is_dir():
-            continue
-        meta_path = qdir / "meta.json"
-        if not meta_path.exists():
-            continue
-        try:
-            meta = json.loads(meta_path.read_text("utf-8"))
-        except json.JSONDecodeError:
-            continue
-        table.add_row(
-            meta.get("query_id", qdir.name),
-            (meta.get("user_query", "") or "")[:60],
-            str(len(meta.get("docs", {}))),
-            str(len(meta.get("code", {}))),
-        )
-    console.print(table)
+
+    # Scan store (fast mode queries).
+    seen_ids: set[str] = set()
+    if cfg.store_dir.exists():
+        for qdir in sorted(cfg.store_dir.iterdir()):
+            if not qdir.is_dir():
+                continue
+            meta_path = qdir / "meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            qid = meta.get("query_id", qdir.name)
+            seen_ids.add(qid)
+            table.add_row(
+                qid,
+                "fast",
+                (meta.get("user_query", "") or "")[:60],
+                str(len(meta.get("docs", {}))),
+                str(len(meta.get("code", {}))),
+            )
+
+    # Scan trajectories (deep mode queries).
+    traj_dir = cfg.ultres_dir / "trajectories"
+    if traj_dir.exists():
+        for traj_file in sorted(traj_dir.iterdir()):
+            if not traj_file.suffix == ".jsonl":
+                continue
+            qid = traj_file.stem
+            if qid in seen_ids:
+                continue
+            try:
+                record = json.loads(traj_file.read_text("utf-8").strip().split("\n")[0])
+            except (json.JSONDecodeError, IndexError):
+                continue
+            mode = record.get("mode", "?")
+            pages = record.get("pages_crawled", 0)
+            code_count = len(record.get("code_ids", []))
+            table.add_row(
+                qid,
+                mode,
+                (record.get("query", "") or "")[:60],
+                str(pages),
+                str(code_count),
+            )
+
+    if table.row_count == 0:
+        console.print("[dim]No queries yet.[/dim]")
+    else:
+        console.print(table)
 
 
 @app.command("show")
 def show_query(query_id: str = typer.Argument(..., help="The query_id to show.")):
-    """Print a past answer + research tree."""
+    """Print a past answer + research tree (works for fast and deep mode)."""
     cfg = UltResConfig.load()
+
+    # Show answer.
     answer_path = cfg.answers_dir / f"{query_id}.md"
     if answer_path.exists():
         console.print(Panel(answer_path.read_text("utf-8"), title=f"Answer {query_id}", border_style="green"))
     else:
         console.print(f"[red]No answer found for {query_id}[/red]")
 
+    # Show store meta (fast mode).
     meta_path = cfg.store_dir / query_id / "meta.json"
     if meta_path.exists():
         meta = json.loads(meta_path.read_text("utf-8"))
-        console.print(Panel(json.dumps(meta, indent=2), title="Research tree", border_style="cyan"))
+        console.print(Panel(json.dumps(meta, indent=2), title="Research tree (fast mode)", border_style="cyan"))
+
+    # Show trajectory (deep mode).
+    traj_path = cfg.ultres_dir / "trajectories" / f"{query_id}.jsonl"
+    if traj_path.exists():
+        record = json.loads(traj_path.read_text("utf-8").strip().split("\n")[0])
+        # Show plan + brief if available.
+        if record.get("plan"):
+            console.print(Panel(record["plan"][:2000], title="Implementation Plan (Pass 1)", border_style="blue"))
+        if record.get("brief"):
+            console.print(Panel(record["brief"][:2000], title="Master Research Brief", border_style="magenta"))
+        # Show trajectory metadata.
+        summary = {k: v for k, v in record.items() if k not in ("answer", "plan", "brief")}
+        console.print(Panel(json.dumps(summary, indent=2), title="Trajectory (deep mode)", border_style="cyan"))
 
 
 @app.command("clean")
 def clean():
-    """Remove all stored queries + vector index (keeps config + models)."""
+    """Remove all stored data (keeps config + models)."""
     cfg = UltResConfig.load()
     import shutil
     if cfg.store_dir.exists():
@@ -367,6 +412,138 @@ def clean():
     if cfg.answers_dir.exists():
         shutil.rmtree(cfg.answers_dir)
         console.print("[green]Cleared answers.[/green]")
+    traj_dir = cfg.ultres_dir / "trajectories"
+    if traj_dir.exists():
+        shutil.rmtree(traj_dir)
+        console.print("[green]Cleared trajectories.[/green]")
+
+
+# ---------------------------------------------------------------------------
+# trajectories subcommands (v1.4: v1.5 QLoRA training prep)
+# ---------------------------------------------------------------------------
+
+@trajectories_app.command("list")
+def trajectories_list():
+    """List all saved trajectories (fast + deep mode)."""
+    cfg = UltResConfig.load()
+    from ultres.lora.cache import list_trajectories
+    trajectories = list_trajectories(cfg.ultres_dir / "trajectories")
+    if not trajectories:
+        console.print("[dim]No trajectories yet. Run some queries first.[/dim]")
+        return
+    table = Table(title=f"Trajectories ({len(trajectories)})")
+    table.add_column("query_id", style="cyan")
+    table.add_column("mode")
+    table.add_column("type")
+    table.add_column("query")
+    table.add_column("pages", justify="right")
+    table.add_column("answer chars", justify="right")
+    for t in trajectories:
+        table.add_row(
+            t.get("query_id", "?"),
+            t.get("mode", "?"),
+            t.get("query_type", "?"),
+            (t.get("query", "") or "")[:50],
+            str(t.get("pages_crawled", 0) or 0),
+            str(len(t.get("answer", "") or "")),
+        )
+    console.print(table)
+
+
+@trajectories_app.command("stats")
+def trajectories_stats():
+    """Show trajectory statistics for v1.5 QLoRA planning."""
+    cfg = UltResConfig.load()
+    from ultres.lora.cache import trajectory_stats
+    stats = trajectory_stats(cfg.ultres_dir / "trajectories")
+    if stats["total"] == 0:
+        console.print("[dim]No trajectories yet.[/dim]")
+        return
+    console.print(Panel(
+        f"Total trajectories: [bold]{stats['total']}[/bold]\n"
+        f"  Fast mode: {stats['by_mode'].get('fast', 0)}\n"
+        f"  Deep mode: {stats['by_mode'].get('deep', 0)}\n\n"
+        f"By query type:\n"
+        f"  Code: {stats['by_query_type'].get('code', 0)}\n"
+        f"  General: {stats['by_query_type'].get('general', 0)}\n"
+        f"  Mixed: {stats['by_query_type'].get('mixed', 0)}\n\n"
+        f"Total pages crawled: {stats['total_pages']}\n"
+        f"Avg pages per deep query: {stats['avg_pages_deep']:.1f}\n"
+        f"Avg answer length: {stats['avg_answer_chars']:.0f} chars\n"
+        f"Total estimated tokens: {stats['total_estimated_tokens']:,}",
+        title="Trajectory Statistics",
+        border_style="cyan",
+    ))
+
+
+@trajectories_app.command("export")
+def trajectories_export(
+    output: str = typer.Option("train.jsonl", "--output", "-o", help="Output file path"),
+    format: str = typer.Option("jsonl", "--format", "-f", help="jsonl or json"),
+):
+    """Export trajectories as training-ready JSONL for v1.5 QLoRA."""
+    cfg = UltResConfig.load()
+    from ultres.lora.cache import export_trajectories
+    output_path = Path(output)
+    count = export_trajectories(
+        cfg.ultres_dir / "trajectories", output_path, format=format,
+    )
+    if count == 0:
+        console.print("[red]No valid trajectories to export.[/red]")
+        return
+    console.print(f"[green]Exported {count} training examples to {output_path}[/green]")
+    console.print(f"[dim]Format: {format} | Ready for v1.5 QLoRA training[/dim]")
+
+
+@trajectories_app.command("show")
+def trajectories_show(
+    query_id: str = typer.Argument(..., help="The query_id to show."),
+):
+    """Show a single trajectory in detail."""
+    cfg = UltResConfig.load()
+    traj_path = cfg.ultres_dir / "trajectories" / f"{query_id}.jsonl"
+    if not traj_path.exists():
+        console.print(f"[red]No trajectory found for {query_id}[/red]")
+        return
+    record = json.loads(traj_path.read_text("utf-8").strip().split("\n")[0])
+    # Show key fields.
+    for key in ("query_id", "query", "mode", "query_type", "pages_crawled",
+                "clusters", "steps", "timestamp"):
+        if key in record and record[key] is not None:
+            console.print(f"[cyan]{key}:[/cyan] {record[key]}")
+    # Show plan (truncated).
+    if record.get("plan"):
+        console.print(Panel(record["plan"][:2000], title="Plan (Pass 1)", border_style="blue"))
+    # Show brief (truncated).
+    if record.get("brief"):
+        console.print(Panel(record["brief"][:2000], title="Master Brief", border_style="magenta"))
+    # Show answer (truncated).
+    if record.get("answer"):
+        console.print(Panel(record["answer"][:3000], title="Answer", border_style="green"))
+    # Show sources.
+    if record.get("visited_urls"):
+        urls = record["visited_urls"][:20]
+        console.print(f"[dim]Sources ({len(record['visited_urls'])} total):[/dim]")
+        for u in urls:
+            console.print(f"  [dim]- {u}[/dim]")
+
+
+@trajectories_app.command("validate")
+def trajectories_validate():
+    """Validate all trajectories for training readiness."""
+    cfg = UltResConfig.load()
+    from ultres.lora.cache import validate_all_trajectories
+    results = validate_all_trajectories(cfg.ultres_dir / "trajectories")
+    if not results:
+        console.print("[dim]No trajectories to validate.[/dim]")
+        return
+    valid_count = sum(1 for _, is_valid, _ in results if is_valid)
+    console.print(f"[green]{valid_count}/{len(results)} trajectories valid[/green]")
+    for qid, is_valid, issues in results:
+        if is_valid:
+            console.print(f"  [green]✓[/green] {qid}")
+        else:
+            console.print(f"  [red]✗[/red] {qid}: {'; '.join(issues)}")
 
 
 # Redirect bare queries to `run` before Typer processes args.

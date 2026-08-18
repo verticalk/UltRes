@@ -130,6 +130,8 @@ class DeepResearchConfig(BaseModel):
     min_page_quality: float = 0.15
     # Enable live streaming output.
     enable_streaming: bool = True
+    # v1.4: Overall pipeline timeout in minutes (0 = no timeout).
+    pipeline_timeout_min: int = 90
 
 
 class UltResConfig(BaseModel):

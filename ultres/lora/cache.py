@@ -126,3 +126,165 @@ def trajectory_count(trajectories_dir: Path) -> int:
     if not trajectories_dir.exists():
         return 0
     return len(list(trajectories_dir.glob("*.jsonl")))
+
+
+# ---------------------------------------------------------------------------
+# v1.4: Trajectory export, validation, and statistics for v1.5 QLoRA
+# ---------------------------------------------------------------------------
+
+def export_trajectories(
+    trajectories_dir: Path,
+    output_path: Path,
+    format: str = "jsonl",
+) -> int:
+    """Export trajectories as training-ready JSONL for v1.5 QLoRA.
+
+    Produces instruction/response pairs suitable for Unsloth/Qwen QLoRA:
+        {"instruction": "...", "input": "", "output": "...", "context": "..."}
+
+    For deep mode trajectories, the brief is included as context.
+    For fast mode trajectories, the visited URLs are included as context.
+
+    Args:
+        trajectories_dir: Directory containing .jsonl trajectory files.
+        output_path: Where to write the exported dataset.
+        format: "jsonl" (default) or "json" (list format).
+
+    Returns:
+        Number of exported examples.
+    """
+    trajectories = list_trajectories(trajectories_dir)
+    examples: list[dict[str, Any]] = []
+    for traj in trajectories:
+        query = traj.get("query", "")
+        answer = traj.get("answer", "")
+        if not query or not answer:
+            continue
+        # Build context from brief (deep mode) or URLs (fast mode).
+        context_parts: list[str] = []
+        if traj.get("brief"):
+            context_parts.append(f"Research brief:\n{traj['brief']}")
+        if traj.get("plan"):
+            context_parts.append(f"Implementation plan:\n{traj['plan']}")
+        if traj.get("visited_urls"):
+            urls = traj["visited_urls"][:20]
+            context_parts.append("Sources:\n" + "\n".join(f"- {u}" for u in urls))
+        context = "\n\n".join(context_parts)
+        examples.append({
+            "instruction": query,
+            "input": "",
+            "output": answer,
+            "context": context,
+            "mode": traj.get("mode", "unknown"),
+            "query_type": traj.get("query_type", "unknown"),
+        })
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if format == "json":
+        import json as _json
+        output_path.write_text(_json.dumps(examples, indent=2), "utf-8")
+    else:  # jsonl
+        with output_path.open("w", encoding="utf-8") as f:
+            for ex in examples:
+                f.write(json.dumps(ex) + "\n")
+    return len(examples)
+
+
+def validate_trajectory(record: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Validate a single trajectory record for training readiness.
+
+    Returns (is_valid, list_of_issues).
+    """
+    issues: list[str] = []
+    # Required fields.
+    required = ["query_id", "query", "answer", "mode", "timestamp"]
+    for field_name in required:
+        if field_name not in record:
+            issues.append(f"missing field: {field_name}")
+    # Non-empty answer.
+    if record.get("answer") and len(record["answer"].strip()) < 10:
+        issues.append("answer too short (<10 chars)")
+    # Non-empty query.
+    if record.get("query") and len(record["query"].strip()) < 3:
+        issues.append("query too short (<3 chars)")
+    # Minimum content.
+    mode = record.get("mode", "")
+    if mode == "fast":
+        if not record.get("visited_urls"):
+            issues.append("fast mode: no visited URLs")
+    elif mode == "deep":
+        pages = record.get("pages_crawled", 0)
+        if pages < 10:
+            issues.append(f"deep mode: only {pages} pages crawled (min 10)")
+    else:
+        issues.append(f"unknown mode: {mode}")
+    return (len(issues) == 0, issues)
+
+
+def validate_all_trajectories(
+    trajectories_dir: Path,
+) -> list[tuple[str, bool, list[str]]]:
+    """Validate all trajectories in a directory.
+
+    Returns list of (query_id, is_valid, issues) tuples.
+    """
+    trajectories = list_trajectories(trajectories_dir)
+    results: list[tuple[str, bool, list[str]]] = []
+    for traj in trajectories:
+        qid = traj.get("query_id", "unknown")
+        is_valid, issues = validate_trajectory(traj)
+        results.append((qid, is_valid, issues))
+    return results
+
+
+def trajectory_stats(trajectories_dir: Path) -> dict[str, Any]:
+    """Compute statistics over all trajectories.
+
+    Returns a dict with:
+        - total: total count
+        - by_mode: {"fast": N, "deep": N}
+        - by_query_type: {"code": N, "general": N, "mixed": N}
+        - total_pages: sum of pages_crawled
+        - avg_pages_deep: average pages per deep query
+        - avg_answer_chars: average answer length in chars
+        - total_estimated_tokens: estimated total tokens
+    """
+    trajectories = list_trajectories(trajectories_dir)
+    stats: dict[str, Any] = {
+        "total": len(trajectories),
+        "by_mode": {"fast": 0, "deep": 0, "unknown": 0},
+        "by_query_type": {"code": 0, "general": 0, "mixed": 0, "unknown": 0},
+        "total_pages": 0,
+        "avg_pages_deep": 0.0,
+        "avg_answer_chars": 0.0,
+        "total_estimated_tokens": 0,
+    }
+    deep_count = 0
+    deep_pages = 0
+    total_answer_chars = 0
+    total_tokens = 0
+    for traj in trajectories:
+        mode = traj.get("mode", "unknown")
+        stats["by_mode"][mode] = stats["by_mode"].get(mode, 0) + 1
+        qtype = traj.get("query_type", "unknown")
+        stats["by_query_type"][qtype] = stats["by_query_type"].get(qtype, 0) + 1
+        pages = traj.get("pages_crawled", 0) or 0
+        stats["total_pages"] += pages
+        if mode == "deep":
+            deep_count += 1
+            deep_pages += pages
+        answer = traj.get("answer", "") or ""
+        total_answer_chars += len(answer)
+        # Rough token estimate (~4 chars/token).
+        total_tokens += len(answer) // 4
+        if traj.get("brief"):
+            total_tokens += len(traj["brief"]) // 4
+        if traj.get("plan"):
+            total_tokens += len(traj["plan"]) // 4
+    if deep_count > 0:
+        stats["avg_pages_deep"] = deep_pages / deep_count
+    if len(trajectories) > 0:
+        stats["avg_answer_chars"] = total_answer_chars / len(trajectories)
+    stats["total_estimated_tokens"] = total_tokens
+    return stats

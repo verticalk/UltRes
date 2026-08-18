@@ -159,7 +159,131 @@ def fetch_page(
 
 
 async def fetch_page_async(url: str, timeout: float = 30.0) -> Page:
-    """Async wrapper around `fetch_page` (runs sync work in a thread)."""
+    """Async wrapper around `fetch_page` (runs sync work in a thread).
+
+    Uses Playwright-first (original behavior) — for the fast agentic loop
+    where single-page quality matters more than speed.
+    """
     import asyncio
 
     return await asyncio.to_thread(fetch_page, url, timeout)
+
+
+# Thresholds for deciding if httpx response is "good enough" or needs
+# Playwright fallback. Pages shorter than this or with very few words
+# likely need JS rendering.
+_MIN_HTTPX_TEXT_CHARS = 500
+_MIN_HTTPX_WORD_COUNT = 50
+
+# Domains known to require JS rendering (httpx won't get usable content).
+_JS_HEAVY_DOMAINS = {
+    "twitter.com", "x.com", "reactjs.org", "vuejs.org",
+    "angular.io", "svelte.dev",
+}
+
+
+def _needs_playwright_fallback(html: str, url: str) -> bool:
+    """Check if the httpx response is too thin and needs Playwright."""
+    if not html or len(html) < _MIN_HTTPX_TEXT_CHARS:
+        return True
+    # Check word count of extracted text.
+    text = trafilatura.extract(
+        html, include_comments=False, favor_recall=True,
+        output_format="markdown",
+    ) or ""
+    if len(text.split()) < _MIN_HTTPX_WORD_COUNT:
+        return True
+    # Check known JS-heavy domains.
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc.lower()
+    if any(d in domain for d in _JS_HEAVY_DOMAINS):
+        return True
+    return False
+
+
+def fetch_page_httpx_first(
+    url: str,
+    timeout: float = 30.0,
+) -> Page:
+    """Fetch a page trying httpx first, falling back to Playwright.
+
+    For bulk crawling (2000+ pages), this avoids launching Chromium for
+    every page. httpx is ~10x faster and uses no browser memory. Only
+    falls back to Playwright if httpx returns empty/JS-heavy content.
+
+    Args:
+        url: URL to fetch.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        Page with extracted content + code blocks.
+    """
+    html: str | None = None
+    error: str | None = None
+
+    # Try httpx first.
+    try:
+        html = _fetch_html_httpx(url, timeout)
+        error = None
+    except Exception as e:
+        error = f"httpx: {e}"
+        html = None
+
+    # Check if httpx response is good enough.
+    if html and not _needs_playwright_fallback(html, url):
+        # httpx response is good — extract content.
+        code_blocks = _extract_code_blocks_from_html(html, url)
+        extracted = trafilatura.extract(
+            html, include_comments=False, include_tables=True,
+            favor_recall=True, output_format="markdown",
+        ) or ""
+        meta = trafilatura.bare_extraction(html, include_comments=False)
+        if meta is not None:
+            if isinstance(meta, dict):
+                title = meta.get("title") or url
+            else:
+                title = getattr(meta, "title", None) or url
+        else:
+            title = url
+        return Page(
+            url=url, title=title or url, text=extracted,
+            code_blocks=code_blocks, raw_html=html, fetch_error=None,
+        )
+
+    # Fallback to Playwright.
+    try:
+        html = _fetch_html_playwright(url, timeout)
+        error = None
+    except Exception as e:
+        if error:
+            error = f"{error}; playwright: {e}"
+        else:
+            error = f"playwright: {e}"
+        if html is None:
+            return Page(url=url, title="", text="", fetch_error=error)
+
+    # Extract from Playwright HTML.
+    code_blocks = _extract_code_blocks_from_html(html, url)
+    extracted = trafilatura.extract(
+        html, include_comments=False, include_tables=True,
+        favor_recall=True, output_format="markdown",
+    ) or ""
+    meta = trafilatura.bare_extraction(html, include_comments=False)
+    if meta is not None:
+        if isinstance(meta, dict):
+            title = meta.get("title") or url
+        else:
+            title = getattr(meta, "title", None) or url
+    else:
+        title = url
+    return Page(
+        url=url, title=title or url, text=extracted,
+        code_blocks=code_blocks, raw_html=html, fetch_error=error,
+    )
+
+
+async def fetch_page_httpx_first_async(url: str, timeout: float = 30.0) -> Page:
+    """Async wrapper around `fetch_page_httpx_first`."""
+    import asyncio
+
+    return await asyncio.to_thread(fetch_page_httpx_first, url, timeout)

@@ -25,7 +25,6 @@ _CODE_KEYWORDS = {
     "debug", "compile", "build", "library", "framework", "api", "endpoint",
     "program", "programming", "developer", "implement", "implementation",
     "refactor", "syntax", "runtime", "binary", "executable", "script",
-    "calculator", "app", "application", "software", "game", "engine",
     "shader", "opengl", "vulkan", "directx", "webgl", "cuda", "kernel",
     "concurrency", "multithreading", "async", "await", "callback",
 }
