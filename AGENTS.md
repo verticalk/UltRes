@@ -4,6 +4,12 @@ Guidance for AI agents (and humans) working on the UltRes codebase.
 
 **Repo:** https://github.com/verticalk/UltRes (private)
 
+> **Keep this file up to date.** If you make changes to the codebase — new
+> features, fixed bugs, changed dependencies, updated configs, new verification
+> results, roadmap progress — update the relevant sections of AGENTS.md in the
+> same commit. Do not let this file go stale. It is the single source of truth
+> for project status, build/test commands, and architecture decisions.
+
 ## Project status
 
 **v1 — complete and verified.** End-to-end local research agent working.
