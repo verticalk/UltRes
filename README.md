@@ -2,7 +2,7 @@
 
 **UltRes** is a lightweight, locally-runnable AI that performs like a flagship model on a user's specific request by aggressively researching the web, building a disk-backed knowledge store for that exact task, and reasoning over it with a small agentic model — cheap, private, and dynamic.
 
-The base model is a custom fine-tuned + long-context-extended derivative of [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF) (Apache 2.0), built using only free GPU compute. v1.1 ships as a wrapper around the stock model with GPU acceleration, native tool calling, and self-critique; v1.5/v2 add the custom UltRes checkpoints trained on accumulated agent trajectories.
+The base model is a custom fine-tuned + long-context-extended derivative of [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF) (Apache 2.0), built using only free GPU compute. v1.2 ships as a deep research pipeline wrapping the stock model with bulk crawling, gap detection, two-pass implementation, and live streaming; v1.5/v2 add the custom UltRes checkpoints trained on accumulated agent trajectories.
 
 ## Why UltRes
 
@@ -71,17 +71,22 @@ export ULTRES_SEARCH_API_KEY=BSAxxxxxxxx
 ## Usage
 
 ```bash
-# Pull the model first (~4.7 GB download for Q4_K_M, multi-part GGUF)
-ultres models pull
+# Pull the models first (~4.7 GB each, multi-part GGUF)
+ultres models pull                  # Instruct model (default)
+ultres models pull --model coder    # Coder model (for two-pass implementation)
 
-# Run a query (GPU-accelerated, native tool calling, self-critique)
+# Deep research query (default, 2000+ pages, ~40-60 min, live streaming)
 ultres "build me a complex C++ calculator app"
 
-# Deep research (up to 100 steps)
-ultres --deep "explain how LLVM's instruction selection works"
+# Fast mode (v1.1 agentic loop, 30 steps, ~2 min)
+ultres --fast "What is C++ std::vector?"
 
-# Use the code-focused model for code-specific tasks
-ultres --model coder "optimize this C++ function"
+# Limit crawl scope
+ultres --max-pages 500 "query"
+
+# Disable self-critique or streaming
+ultres --no-critique "query"
+ultres --no-stream "query"
 
 # Use a specific search backend
 ultres --search tavily "compare Rust async runtimes"
@@ -99,12 +104,12 @@ ultres config
 ultres clean
 ```
 
-## Hardware requirements (v1.1)
+## Hardware requirements (v1.2)
 
 - **CPU:** modern multi-core (tested on i7-13700K)
-- **RAM:** 16 GB minimum (model is ~4.7 GB at Q4_K_M + OS + KV cache)
-- **GPU:** NVIDIA with 8GB+ VRAM recommended. RTX 4060 Ti 8GB fully offloads the 7B Q4_K_M for ~40+ tok/s. CPU-only works at ~2-3 tok/s.
-- **Disk:** ~5 GB for the model + 50-200 MB per deep research query
+- **RAM:** 16 GB minimum (model ~4.7 GB + KV cache for 64K context + OS)
+- **GPU:** NVIDIA with 8GB+ VRAM recommended. RTX 4060 Ti 8GB: 43.6 tok/s. CPU-only works at ~2-3 tok/s.
+- **Disk:** ~10 GB for both models + 100-200 MB per deep research query
 
 ## How "effectively unlimited context" works
 
@@ -127,9 +132,9 @@ This is the [MemGPT/Letta](https://github.com/cpacker/MemGPT) pattern + the DR-V
 
 | Phase | What | Compute |
 |---|---|---|
-| **v1.1** (this release) | GPU-accelerated agent wrapper around stock Qwen2.5-7B-Instruct + native tool calling + self-critique + trajectory accumulation | Your hardware (no training) |
+| **v1.2** (this release) | Deep research pipeline: bulk crawl 2000+ pages, gap detection, two-pass Instruct→Coder implementation, live streaming, 64K YaRN context | Your hardware (no training) |
 | **v1.5** | QLoRA-specialize Qwen2.5-7B-Instruct on accumulated UltRes agent trajectories → `UltRes-Base-7B` | Kaggle free T4×2 (30 hrs/week) |
-| **v2** | Full fine-tune + YaRN long-context extension (32K→256K) → `UltRes-Base-7B-Long` + per-project LoRA cache training | Vultr $250 free A100 80GB credits (~68 hrs) |
+| **v2** | Full fine-tune + YaRN long-context extension (64K→256K) → `UltRes-Base-7B-Long` + per-project LoRA cache training | Vultr $250 free A100 80GB credits (~68 hrs) |
 | Future | Continued pretraining; UltRes Lite (4B); shared adapter hub | NVIDIA Inception credits (optional) |
 
 See [the full plan](.devin/plans/) for architecture details and verification criteria.
@@ -140,9 +145,10 @@ See [the full plan](.devin/plans/) for architecture details and verification cri
 ultres/
   cli.py                 # Typer CLI entrypoint
   config.py              # Pydantic settings, TOML I/O
+  streaming.py           # Live terminal streaming + SSE endpoint
   models/
-    loader.py            # GGUF download + llama.cpp init
-    registry.py          # Model URLs + quant presets
+    loader.py            # GGUF download + llama.cpp init + YaRN + dual model
+    registry.py          # Model URLs + quant presets + extended context
   search/
     base.py              # SearchProvider interface + data types
     searxng.py           # Local SearXNG provider
@@ -154,11 +160,18 @@ ultres/
     vector.py            # Chroma in-process index
     kv_cache.py          # KV cache reuse wrapper (v2: real persistence)
     hierarchical.py      # Summary tree builder
+  research/              # v1.2 deep research pipeline
+    crawler.py           # Bulk crawl engine (parallel fetch, link following)
+    source_prioritizer.py # Query type detection + URL ranking + page scoring
+    clusterer.py         # Vector clustering + TF-IDF labels
+    gap_detector.py      # Coverage map + missing topic detection
+    compressor.py        # Batch summarize + hierarchical compression
+    pipeline.py          # Deep research orchestrator (10 stages)
   agent/
     tools.py             # Tool schemas (native function calling)
-    planner.py           # Query decomposition
-    research_loop.py     # Agentic research loop + synthesis + self-critique
-    reasoner.py          # Final answer synthesis
+    planner.py           # Query decomposition + plan_deep() with query expansion
+    research_loop.py     # Fast agentic research loop (v1.1)
+    reasoner.py          # Final answer + two_pass_implement() (v1.2)
   lora/
     cache.py             # Per-project adapter loader + trajectory accumulation
 ```

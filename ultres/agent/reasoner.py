@@ -4,8 +4,9 @@ After the research loop ends, this produces the streamed final answer. In v1
 the loop's `finish` tool already produces the answer, so this module is a thin
 wrapper that handles streaming to the terminal and writing to disk.
 
-In v2 (with the long-context UltRes-Base-7B-Long), this may do an extra
-`recall`-backed final check over the full topic summaries + loaded code.
+v1.2 adds two_pass_implement() for the deep research pipeline:
+  Pass 1 (Instruct): synthesize research into an implementation plan
+  Pass 2 (Coder): implement from the plan, forced to follow research
 """
 
 from __future__ import annotations
@@ -18,6 +19,9 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
+
+from ultres.research.compressor import MasterBrief
+from ultres.streaming import ResearchStreamer
 
 
 def stream_answer(
@@ -61,3 +65,143 @@ def final_reasoning_pass(
         max_tokens=2048,
     )
     return resp["choices"][0]["message"]["content"].strip()
+
+
+# ---------------------------------------------------------------------------
+# v1.2: Two-pass implementation
+# ---------------------------------------------------------------------------
+
+_PASS1_SYSTEM = """\
+You are the architecture planner for UltRes, a research-driven AI. \
+You have been given a master research brief derived from analyzing \
+thousands of web pages. Your job is to write a detailed implementation \
+plan based on this research.
+
+The plan must:
+- Specify the exact architecture and file structure
+- Name the specific algorithms and patterns to use (from the research)
+- Reference specific code examples that should be adapted
+- List all libraries and tools recommended by the research
+- Identify potential pitfalls and how to handle them
+- Be specific enough that a coder can implement it without making \
+  architecture decisions
+
+Do NOT write code. Write a PLAN that a coder will follow.
+"""
+
+_PASS2_SYSTEM = """\
+You are the implementation engine for UltRes. You MUST implement based on \
+the plan below. The plan is derived from web research of thousands of pages.
+
+CRITICAL RULES:
+1. Do NOT substitute your own pretrained knowledge for research-based \
+   architecture decisions. The plan specifies which algorithms, patterns, \
+   and libraries to use — USE THOSE.
+2. Use the provided code examples as reference and adapt them.
+3. If the plan specifies an algorithm, use that algorithm.
+4. If the plan specifies a library, use that library.
+5. Your job is to write clean, working code that follows the plan — not to \
+   redesign the architecture.
+
+Write complete, production-quality code. Include error handling, comments, \
+and proper structure as specified in the plan.
+"""
+
+
+def two_pass_implement(
+    llm_instruct: Any,
+    llm_coder: Any | None,
+    user_query: str,
+    brief: MasterBrief,
+    streamer: ResearchStreamer | None = None,
+    temperature: float = 0.4,
+) -> str:
+    """Two-pass implementation: Instruct writes plan, Coder implements.
+
+    Args:
+        llm_instruct: Instruct model for planning (Pass 1).
+        llm_coder: Coder model for implementation (Pass 2). If None, uses llm_instruct.
+        user_query: The user's original request.
+        brief: Master research brief with code examples.
+        streamer: Optional streamer for live token display.
+        temperature: Generation temperature.
+
+    Returns:
+        The final implementation (code).
+    """
+    # Build code examples text.
+    code_text = "\n\n---\n\n".join(
+        f"```{cb.language or ''}\n{cb.content}\n```"
+        for cb in brief.code_examples
+    )
+
+    # --- Pass 1: Instruct model writes the plan ---
+    pass1_prompt = (
+        f"User request: {user_query}\n\n"
+        f"Master research brief ({brief.total_pages} pages, "
+        f"{brief.total_clusters} clusters, {brief.total_code_blocks} code blocks):\n\n"
+        f"{brief.text}\n\n"
+        f"Best code examples from research:\n\n{code_text[:30000]}\n\n"
+        f"Write a detailed implementation plan for this request. "
+        f"Be specific about architecture, algorithms, file structure, and libraries."
+    )
+
+    if streamer and streamer.enabled:
+        streamer.print("\n[bold cyan]Pass 1: Writing implementation plan (Instruct model)...[/bold cyan]")
+
+    if streamer and streamer.enabled:
+        plan = streamer.token_stream(
+            llm_instruct,
+            messages=[
+                {"role": "system", "content": _PASS1_SYSTEM},
+                {"role": "user", "content": pass1_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=4096,
+        )
+    else:
+        resp = llm_instruct.create_chat_completion(
+            messages=[
+                {"role": "system", "content": _PASS1_SYSTEM},
+                {"role": "user", "content": pass1_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=4096,
+        )
+        plan = resp["choices"][0]["message"]["content"].strip()
+
+    # --- Pass 2: Coder model implements from the plan ---
+    coder = llm_coder or llm_instruct
+    pass2_prompt = (
+        f"User request: {user_query}\n\n"
+        f"Implementation plan (derived from research — FOLLOW THIS):\n\n{plan}\n\n"
+        f"Reference code examples from research:\n\n{code_text[:30000]}\n\n"
+        f"Now implement the complete solution based on this plan. "
+        f"Write all the code. Follow the plan exactly."
+    )
+
+    if streamer and streamer.enabled:
+        streamer.print("\n[bold cyan]Pass 2: Implementing from plan (Coder model)...[/bold cyan]")
+
+    if streamer and streamer.enabled:
+        implementation = streamer.token_stream(
+            coder,
+            messages=[
+                {"role": "system", "content": _PASS2_SYSTEM},
+                {"role": "user", "content": pass2_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=8192,
+        )
+    else:
+        resp = coder.create_chat_completion(
+            messages=[
+                {"role": "system", "content": _PASS2_SYSTEM},
+                {"role": "user", "content": pass2_prompt},
+            ],
+            temperature=temperature,
+            max_tokens=8192,
+        )
+        implementation = resp["choices"][0]["message"]["content"].strip()
+
+    return implementation

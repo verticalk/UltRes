@@ -29,6 +29,8 @@ class ModelSpec:
     is_ultres: bool = False
     # sha256 of the default-quant GGUF file (filled in once pinned).
     sha256: str | None = None
+    # Extended context via YaRN (0 = no extension, otherwise target ctx).
+    extended_ctx: int = 0
 
 
 _REGISTRY: dict[str, ModelSpec] = {
@@ -42,7 +44,7 @@ _REGISTRY: dict[str, ModelSpec] = {
         default_quant="Q4_K_M",
         label="Qwen2.5-7B-Instruct (stock)",
         is_ultres=False,
-        # sha256 pinned once the exact file is confirmed at install time.
+        extended_ctx=65_536,  # YaRN 2x extension (verified working)
     ),
     # Code-specific tasks: coding model for when the query is purely about code.
     "coder": ModelSpec(
@@ -54,6 +56,7 @@ _REGISTRY: dict[str, ModelSpec] = {
         default_quant="Q4_K_M",
         label="Qwen2.5-Coder-7B-Instruct (code-focused)",
         is_ultres=False,
+        extended_ctx=65_536,
     ),
     # v1.5: populated when UltRes-Base-7B is published.
     "ultres-base": ModelSpec(

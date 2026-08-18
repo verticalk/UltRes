@@ -50,6 +50,9 @@ class ModelConfig(BaseModel):
     n_ctx: int | None = None
     # GPU layers to offload. -1 = all, 0 = CPU only.
     n_gpu_layers: int = -1
+    # v1.2: Extend context via YaRN rope scaling (32K → 64K).
+    use_extended_context: bool = True
+    extended_ctx: int = 65_536
 
 
 class SearchConfig(BaseModel):
@@ -96,6 +99,39 @@ class MemoryConfig(BaseModel):
     kv_cache_reuse: bool = True
 
 
+class DeepResearchConfig(BaseModel):
+    """v1.2 deep research pipeline settings."""
+
+    # Max pages to crawl per query (across all rounds).
+    max_pages: int = 2000
+    # Concurrent page fetches during bulk crawl.
+    crawl_concurrency: int = 15
+    # Link-following depth (hops from initial search results).
+    crawl_depth: int = 2
+    # Cosine similarity threshold for clustering (0.0-1.0).
+    cluster_threshold: float = 0.7
+    # Max code examples to select for the final implementation context.
+    max_code_examples: int = 15
+    # Max tokens for batch summarize model calls.
+    batch_summarize_max_tokens: int = 800
+    # Target word count for the master brief.
+    master_brief_max_words: int = 5000
+    # Use two-pass implementation (Instruct plan → Coder implement).
+    enable_two_pass: bool = True
+    # Which model to use for the implementation pass.
+    coder_model: str = "coder"
+    # Gap detection: after clustering, detect missing topics and re-crawl.
+    enable_gap_detection: bool = True
+    # How many rounds of gap detection + re-crawl.
+    gap_research_rounds: int = 1
+    # Quality filter: drop low-quality pages.
+    enable_quality_filter: bool = True
+    # Minimum page quality score (0.0-1.0). Pages below this are dropped.
+    min_page_quality: float = 0.15
+    # Enable live streaming output.
+    enable_streaming: bool = True
+
+
 class UltResConfig(BaseModel):
     """Top-level UltRes configuration."""
 
@@ -103,6 +139,7 @@ class UltResConfig(BaseModel):
     search: SearchConfig = Field(default_factory=SearchConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    deep_research: DeepResearchConfig = Field(default_factory=DeepResearchConfig)
 
     # Paths (resolved at load time).
     project_dir: Path = DEFAULT_PROJECT_DIR

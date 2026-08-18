@@ -272,6 +272,8 @@ def load_llama(
 
     Either pass `model_path` directly, or pass `spec` (defaults to cfg's selection).
     Context window defaults to the spec's native_ctx unless cfg.model.n_ctx is set.
+    When cfg.model.use_extended_context is True and the spec supports YaRN,
+    context is extended via rope scaling (32K → 64K).
     """
     # Ensure CUDA DLL paths are available BEFORE importing llama_cpp,
     # because the import itself loads the shared library.
@@ -282,7 +284,16 @@ def load_llama(
         spec = spec or get_spec(cfg.model.selection)
         model_path = download_model(spec, cfg.model.quant, cfg.model_cache_dir)
 
-    n_ctx = cfg.model.n_ctx or spec.native_ctx if spec else cfg.model.n_ctx or 32_768
+    # Determine context window.
+    if cfg.model.n_ctx:
+        n_ctx = cfg.model.n_ctx
+    elif spec and cfg.model.use_extended_context and spec.extended_ctx > 0:
+        n_ctx = cfg.model.extended_ctx or spec.extended_ctx
+    elif spec:
+        n_ctx = spec.native_ctx
+    else:
+        n_ctx = 32_768
+
     n_gpu = overrides.pop("n_gpu_layers", cfg.model.n_gpu_layers)
 
     kwargs: dict[str, Any] = {
@@ -291,10 +302,14 @@ def load_llama(
         "n_gpu_layers": n_gpu,
         "n_threads": max(1, os.cpu_count() or 4),
         "verbose": False,
-        # Let llama-cpp-python auto-detect the chat format from GGUF metadata.
-        # Qwen2.5 GGUF files bake in the correct chat template (with tool support).
-        # Only override if the caller explicitly passes chat_format.
     }
+
+    # YaRN rope scaling for extended context.
+    if spec and cfg.model.use_extended_context and spec.extended_ctx > 0 and n_ctx > spec.native_ctx:
+        # LLAMA_ROPE_SCALING_TYPE_YARN = 2
+        kwargs["rope_scaling_type"] = 2
+        kwargs["yarn_orig_ctx"] = spec.native_ctx
+
     kwargs.update(overrides)
     llm = Llama(**kwargs)
 
@@ -310,6 +325,35 @@ def load_llama(
             stacklevel=2,
         )
     return llm
+
+
+def unload_model(llm: Any) -> None:
+    """Properly free VRAM from a loaded Llama instance.
+
+    Deletes the model object and forces garbage collection + CUDA cache clearing.
+    Needed for dual-model workflows where we swap between Instruct and Coder.
+    """
+    del llm
+    import gc
+
+    gc.collect()
+    try:
+        import torch  # type: ignore[import-not-found]
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def load_coder_model(cfg: UltResConfig) -> "Any":
+    """Load the coder model (Qwen2.5-Coder-7B) for the implementation pass.
+
+    Downloads if needed. Uses the same YaRN extended context as the main model.
+    """
+    spec = get_spec(cfg.deep_research.coder_model)
+    model_path = download_model(spec, cfg.model.quant, cfg.model_cache_dir)
+    return load_llama(cfg, spec=spec, model_path=model_path)
 
 
 def resolve_spec(cfg: UltResConfig) -> ModelSpec:

@@ -73,14 +73,17 @@ def _maybe_redirect_to_run():
 @app.command()
 def run(
     query: str = typer.Argument(..., help='The query, e.g. "build me a complex C++ calculator app"'),
-    deep: bool = typer.Option(False, "--deep", help="max_steps=100"),
+    fast: bool = typer.Option(False, "--fast", help="Use fast agentic loop (30 steps) instead of deep pipeline"),
     search: Optional[str] = typer.Option(None, "--search", help="searxng|tavily|brave"),
-    model: Optional[str] = typer.Option(None, "--model", help="stock|ultres-base|ultres-base-long"),
+    model: Optional[str] = typer.Option(None, "--model", help="stock|coder|ultres-base|ultres-base-long"),
+    max_pages: Optional[int] = typer.Option(None, "--max-pages", help="Max pages to crawl (deep mode)"),
+    no_critique: bool = typer.Option(False, "--no-critique", help="Skip self-critique"),
+    no_stream: bool = typer.Option(False, "--no-stream", help="Disable live streaming"),
     lite: bool = typer.Option(False, "--lite", help="(reserved, future 4B tier)"),
 ):
     """Run the full UltRes research pipeline for a query."""
     if lite:
-        console.print("[yellow]--lite is reserved for a future 4B tier; ignoring in v1.[/yellow]")
+        console.print("[yellow]--lite is reserved for a future 4B tier; ignoring.[/yellow]")
 
     cfg = UltResConfig.load()
     cfg.ensure_dirs()
@@ -90,20 +93,28 @@ def run(
         cfg.search.backend = search  # type: ignore[assignment]
     if model:
         cfg.model.selection = model  # type: ignore[assignment]
-    if deep:
-        cfg.agent.max_steps = 100
+    if max_pages:
+        cfg.deep_research.max_pages = max_pages
+    if no_critique:
+        cfg.agent.enable_self_critique = False
+    if no_stream:
+        cfg.deep_research.enable_streaming = False
 
     # Hardware report.
     ram = detect_ram_gb()
     vram = detect_vram_gb()
     spec = resolve_spec(cfg)
+    mode = "fast agentic" if fast else "deep research"
     console.print(
         Panel(
-            f"[bold]UltRes v0.1[/bold]\n"
+            f"[bold]UltRes v1.2[/bold]\n"
+            f"Mode: {mode}\n"
             f"Model: {spec.label} ({cfg.model.quant})\n"
+            f"Context: {cfg.model.extended_ctx if cfg.model.use_extended_context else spec.native_ctx} tokens\n"
             f"Search: {cfg.search.backend}\n"
             f"RAM: {ram:.1f} GB | VRAM: {vram:.1f} GB\n"
-            f"Max steps: {cfg.agent.max_steps} | Hot window: {cfg.agent.hot_window_token_budget} tokens",
+            + (f"Max pages: {cfg.deep_research.max_pages}\n" if not fast else f"Max steps: {cfg.agent.max_steps}\n")
+            + f"Streaming: {'on' if cfg.deep_research.enable_streaming else 'off'}",
             title="Configuration",
             border_style="cyan",
         )
@@ -115,14 +126,8 @@ def run(
     console.print(f"[green]Model:[/green] {model_path}")
 
     # Lazy import to avoid loading llama-cpp-python on every command.
-    from ultres.models.loader import load_llama
-    from ultres.agent.research_loop import run_research_loop
-    from ultres.agent.reasoner import stream_answer
+    from ultres.models.loader import load_llama, load_coder_model, unload_model
     from ultres.search.base import get_provider
-
-    console.print("[cyan]Loading model into llama.cpp...[/cyan]")
-    llm = load_llama(cfg, spec=spec, model_path=model_path)
-    console.print("[green]Model loaded.[/green]")
 
     # Provider.
     if cfg.search.backend == "searxng":
@@ -134,17 +139,70 @@ def run(
     else:
         raise typer.BadParameter(f"Unknown search backend: {cfg.search.backend}")
 
-    # Run the loop.
-    result = asyncio.run(run_research_loop(llm, cfg, query, provider=provider, console=console))
+    if fast:
+        # --- Fast mode: use the v1.1 agentic loop ---
+        from ultres.agent.research_loop import run_research_loop
+        from ultres.agent.reasoner import stream_answer
 
-    # Stream + persist answer.
-    answer_path = cfg.answers_dir / f"{result.query_id}.md"
-    stream_answer(result.answer, answer_path, console=console)
+        console.print("[cyan]Loading model into llama.cpp...[/cyan]")
+        llm = load_llama(cfg, spec=spec, model_path=model_path)
+        console.print("[green]Model loaded.[/green]")
 
-    console.print(
-        f"\n[dim]query_id={result.query_id} | steps={result.steps} | "
-        f"sources={len(result.visited_urls)}[/dim]"
-    )
+        result = asyncio.run(run_research_loop(llm, cfg, query, provider=provider, console=console))
+
+        answer_path = cfg.answers_dir / f"{result.query_id}.md"
+        stream_answer(result.answer, answer_path, console=console)
+        console.print(
+            f"\n[dim]query_id={result.query_id} | steps={result.steps} | "
+            f"sources={len(result.visited_urls)}[/dim]"
+        )
+    else:
+        # --- Deep mode: v1.2 deep research pipeline ---
+        from ultres.research.pipeline import run_deep_research
+        from ultres.streaming import ResearchStreamer
+
+        console.print("[cyan]Loading Instruct model into llama.cpp...[/cyan]")
+        llm = load_llama(cfg, spec=spec, model_path=model_path)
+        console.print("[green]Instruct model loaded.[/green]")
+
+        # Try to load coder model for two-pass implementation.
+        llm_coder = None
+        if cfg.deep_research.enable_two_pass:
+            try:
+                console.print("[cyan]Loading Coder model for implementation pass...[/cyan]")
+                # Unload instruct first to free VRAM.
+                unload_model(llm)
+                llm_coder = load_coder_model(cfg)
+                console.print("[green]Coder model loaded.[/green]")
+                # Reload instruct for research stages.
+                console.print("[cyan]Reloading Instruct model for research stages...[/cyan]")
+                llm = load_llama(cfg, spec=spec, model_path=model_path)
+                console.print("[green]Instruct model reloaded.[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Coder model unavailable ({e}); using Instruct for both passes.[/yellow]")
+                llm_coder = None
+                try:
+                    llm = load_llama(cfg, spec=spec, model_path=model_path)
+                except Exception:
+                    pass  # llm might still be loaded
+
+        streamer = ResearchStreamer(console=console, enabled=cfg.deep_research.enable_streaming)
+
+        result = asyncio.run(run_deep_research(
+            llm=llm,
+            llm_coder=llm_coder,
+            cfg=cfg,
+            user_query=query,
+            provider=provider,
+            console=console,
+            streamer=streamer,
+        ))
+
+        # For deep mode, the answer is already saved by the pipeline.
+        console.print(
+            f"\n[dim]query_id={result.query_id} | pages={result.pages_crawled} | "
+            f"clusters={result.clusters_found} | sources={len(result.visited_urls)}[/dim]"
+        )
 
 
 # Default command: `ultres "query"` (no subcommand).

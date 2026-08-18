@@ -12,13 +12,13 @@ Guidance for AI agents (and humans) working on the UltRes codebase.
 
 ## Project status
 
-**v1.1 — GPU-accelerated with native tool calling and self-critique.**
+**v1.2 — Deep research pipeline with bulk crawl, gap detection, two-pass implementation, and live streaming.**
 
 | Milestone | Status |
 |---|---|
 | Package scaffold + CLI | Done |
 | Config (Pydantic + TOML) | Done |
-| Model registry + loader (GGUF + llama.cpp) | Done |
+| Model registry + loader (GGUF + llama.cpp + YaRN 64K) | Done |
 | Search layer (SearXNG / Tavily / Brave + fetch) | Done |
 | Memory layer (store / vector / hierarchical / KV cache) | Done |
 | Agent layer (tools / planner / research loop / reasoner) | Done |
@@ -28,26 +28,42 @@ Guidance for AI agents (and humans) working on the UltRes codebase.
 | Synthesis pass (evidence-cited answers) | Done |
 | Self-critique loop (reasoning about reasoning) | Done |
 | Trajectory saving for v1.5 QLoRA | Done |
-| Tests (32 unit tests) | Done — all passing |
+| **v1.2: Deep research pipeline (bulk crawl 2000+ pages)** | **Done** |
+| **v1.2: Query expansion (90-250 search queries)** | **Done** |
+| **v1.2: Source prioritizer (GitHub/SO/cppreference for code)** | **Done** |
+| **v1.2: Vector clustering + TF-IDF labeling** | **Done** |
+| **v1.2: Gap detection + multi-round re-crawl** | **Done** |
+| **v1.2: Batch summarize + hierarchical compression** | **Done** |
+| **v1.2: Two-pass implementation (Instruct plan → Coder code)** | **Done** |
+| **v1.2: Live streaming with per-stage timers** | **Done** |
+| **v1.2: 64K context via YaRN (verified working)** | **Done** |
+| **v1.2: Dual model loading (load/unload Instruct ↔ Coder)** | **Done** |
+| Tests (54 unit tests) | Done — all passing |
 | End-to-end pipeline verified | Done |
 | Git repo + pushed to GitHub | Done |
 
-**v1.1 changes from v1:**
-- **GPU**: Switched from CPU wheel to CUDA 12.1 wheel. 43.6 tokens/sec (was ~2-3 on CPU).
-- **Model**: Switched from Qwen2.5-Coder-7B to Qwen2.5-7B-Instruct (general reasoning + native tool calling). Coder model kept as `coder` registry entry.
-- **Native tool calling**: Tools passed via `tools=` API parameter instead of prompt-based JSON. Fallback JSON parser kept for robustness.
-- **Synthesis pass**: Before `finish`, model is forced to load recalled content and write an evidence-cited answer.
-- **Self-critique**: After `finish`, answer is critiqued against evidence. If gaps found, re-researches and re-synthesizes.
-- **Trajectory accumulation**: Every query saves (query, steps, answer, doc_ids, code_ids) to `.ultres/trajectories/` for v1.5 QLoRA training.
+**v1.2 changes from v1.1:**
+- **Deep research pipeline**: Default mode now crawls 2000+ pages per query (was ~10).
+- **Query expansion**: 30-50 subtasks × 3-5 variations = 90-250 search queries.
+- **Source prioritization**: Code queries prioritize GitHub, Stack Overflow, cppreference.
+- **Quality filtering**: Pages scored and filtered by relevance, content, code blocks.
+- **Clustering**: Vector clustering into 50-200 topic clusters with TF-IDF labels.
+- **Gap detection**: Model reviews coverage, identifies missing topics, re-crawls for gaps.
+- **Batch summarize**: 5 clusters per model call, hierarchical compression into master brief.
+- **Two-pass implementation**: Instruct model writes plan from research, Coder model implements from plan. Coder is FORCED to follow research, not pretrained knowledge.
+- **Live streaming**: Per-stage timers, progress bars, token-by-token streaming for implementation.
+- **64K context**: YaRN rope scaling (verified working on RTX 4060 Ti 8GB).
+- **Dual model loading**: Sequential load/unload of Instruct and Coder models to fit 8GB VRAM.
+- **Fast mode**: `--fast` flag runs the v1.1 agentic loop for quick queries.
 
-**Base model:** Qwen2.5-7B-Instruct Q4_K_M (4.7 GB, Apache 2.0, 32K context).
+**Base model:** Qwen2.5-7B-Instruct Q4_K_M (4.7 GB, Apache 2.0, 64K context via YaRN).
 General-purpose instruct model with native function-calling support.
-Note: Qwen2.5-Coder-7B is also available as `ultres --model coder` for code-specific tasks.
+Coder model: Qwen2.5-Coder-7B-Instruct (used for implementation pass in two-pass mode).
 
 **Roadmap:**
-- v1.1 (done): GPU + Qwen2.5-7B-Instruct + native tool calling + self-critique + trajectories
+- v1.2 (done): Deep research pipeline + 64K context + two-pass + streaming + gap detection
 - v1.5 (next): QLoRA-specialize on accumulated UltRes trajectories → UltRes-Base-7B (Kaggle free T4)
-- v2: full fine-tune + YaRN long-context extension (32K→256K) → UltRes-Base-7B-Long (cloud GPU credits)
+- v2: full fine-tune + YaRN long-context extension (64K→256K) → UltRes-Base-7B-Long (cloud GPU credits)
 
 ## Build & install
 
@@ -68,12 +84,13 @@ playwright install chromium # for the page fetcher
 ## Test
 
 ```bash
-pytest                      # unit tests in tests/ (32 tests, no GPU/model needed)
+pytest                      # unit tests in tests/ (54 tests, no GPU/model needed)
 ```
 
 Tests cover: store CRUD, hierarchical summary tree, vector recall, tool-call
 JSON parsing (native + fallback), config TOML round-trip, LoRA cache stub,
-trajectory save/load. They do NOT require a GPU, downloaded model, or network access.
+trajectory save/load, streaming, source prioritizer, clusterer, gap detector,
+compressor. They do NOT require a GPU, downloaded model, or network access.
 
 ## Run
 
@@ -81,52 +98,64 @@ trajectory save/load. They do NOT require a GPU, downloaded model, or network ac
 # 1. Start SearXNG (one-time):
 docker run -d --name searxng -p 8080:8080 -v ./searxng_settings.yml:/etc/searxng/settings.yml:ro searxng/searxng
 
-# 2. Pull the model (~4.7 GB, multi-part GGUF):
-ultres models pull
+# 2. Pull the models (~4.7 GB each, multi-part GGUF):
+ultres models pull              # Instruct model (default)
+ultres models pull --model coder # Coder model (for two-pass)
 
-# 3. Run a query (GPU-accelerated):
+# 3. Run a deep research query (default, 2000+ pages, ~40-60 min):
 ultres "build me a complex C++ calculator app"
 
-# Code-specific query (uses Qwen2.5-Coder-7B):
-ultres --model coder "optimize this C++ function"
+# 4. Fast mode (v1.1 agentic loop, 30 steps, ~2 min):
+ultres --fast "What is C++ std::vector?"
+
+# 5. Options:
+ultres --max-pages 500 "query"     # Limit crawl to 500 pages
+ultres --no-critique "query"       # Skip self-critique
+ultres --no-stream "query"         # Disable live streaming
 ```
 
 Requires a running SearXNG instance (see README) or a Tavily/Brave API key.
 
 ## Verified working
 
-- **32/32 tests pass** on Python 3.12.8, Windows 11.
-- **GPU**: RTX 4060 Ti 8GB, CUDA 12.1 wheel, **43.6 tokens/sec** (was ~2-3 on CPU).
-- **Model**: Qwen2.5-7B-Instruct Q4_K_M (4.7 GB, multi-part GGUF) — native tool calling confirmed.
-- **Native tool calling**: Qwen2.5-7B-Instruct uses `tools=` API parameter (not prompt-based JSON).
+- **54/54 tests pass** on Python 3.12.8, Windows 11.
+- **GPU**: RTX 4060 Ti 8GB, CUDA 12.1 wheel, **43.6 tokens/sec**.
+- **Model**: Qwen2.5-7B-Instruct Q4_K_M (4.7 GB, multi-part GGUF, 64K via YaRN).
+- **Context**: 64K via YaRN verified working (128K fails — KV cache too large).
+- **Native tool calling**: Qwen2.5-7B-Instruct uses `tools=` API parameter.
 - **Search**: SearXNG in Docker with JSON format + limiter disabled.
-- **Fetch**: trafilatura + httpx extraction works (fixed `bare_extraction` returning Document object instead of dict in trafilatura 2.x).
-- **Self-critique**: After `finish`, answer is critiqued against evidence; gaps trigger re-research.
-- **Trajectories**: Saved to `.ultres/trajectories/` for v1.5 QLoRA training.
+- **Deep pipeline**: 10-stage pipeline with bulk crawl, clustering, gap detection, two-pass implementation.
+- **Live streaming**: Per-stage timers, progress bars, token-by-token streaming.
+- **Self-critique**: After implementation, answer is critiqued against research.
+- **Trajectories**: Saved to `.ultres/trajectories/` with timing data for v1.5 QLoRA.
 
 ## Architecture (one-paragraph)
 
-A user query goes to the **Planner** (one model call → research subtasks), then
-the **Research Loop** (model picks tool calls via native function calling:
-`search`/`visit`/`recall`/`load_summary`/`load_slice`/`load_code`/`finish`).
-Each `visit` fetches a page, extracts text + code blocks, and ingests them into
-the **Knowledge Store** (disk: raw/notes/summaries/code) + **Vector Index**
-(Chroma). The model only sees compact confirmations inline; it pulls full
-content via `load_*` tools as needed. A **HotWindow** evicts old messages when
-the soft token budget is exceeded, keeping the model within its 32K native
-window while the disk store holds everything. On `finish`, a **Synthesis Pass**
-forces the model to load recalled content and write an evidence-cited answer.
-Then a **Self-Critique Loop** checks the answer against evidence and re-researches
-gaps. Finally, the trajectory is saved to `.ultres/trajectories/` for v1.5 QLoRA.
+**Deep mode (default):** A user query goes to the **Planner** (generates 30-50
+subtasks × 3-5 variations = 90-250 search queries). The **Bulk Crawler** fetches
+2000+ pages in parallel with quality filtering and link following. Pages are
+**clustered** into 50-200 topic clusters. **Gap detection** identifies missing
+topics and re-crawls. Clusters are **batch summarized** and hierarchically
+compressed into a **master brief** (~5000 words). **Two-pass implementation**:
+Instruct model writes a plan from the brief, Coder model implements from the
+plan (forced to follow research). **Self-critique** checks the implementation
+against research. Trajectory saved for v1.5 QLoRA. All stages show **live
+streaming** with per-stage timers.
+
+**Fast mode (`--fast`):** The v1.1 agentic loop — model picks tool calls
+(`search`/`visit`/`recall`/`load_*`/`finish`) via native function calling.
+30 steps, ~2 min, touches ~10 pages.
 
 ## Key constraints
 
-- **v1.1 ships no training.** The `lora/` module is a loader stub + trajectory accumulator. Training is v1.5.
-- **v1.1 uses Qwen2.5-7B-Instruct** (32K native ctx, native tool calling). `coder` selection uses Qwen2.5-Coder-7B. `ultres-base` and `ultres-base-long` point at not-yet-published checkpoints — they will 404 until v1.5/v2.
-- **GPU requires CUDA 12.1 wheel** (v0.3.4). The cu124 wheel (v0.3.35) has an illegal instruction issue on this CPU. CPU wheel works as fallback.
-- **KV-cache reuse is best-effort.** `memory/kv_cache.py` tracks attended chunks but does not persist tensors. Falls back to re-inference. v2 wires in real persistence.
-- **Hot window budget defaults to 28K** (under the 32K native limit) to leave headroom for generation. v2 raises this when the native window becomes 256K.
-- **Self-critique adds latency** (1 extra model call per round, default 1 round). Disable via `enable_self_critique=false` in config.
+- **v1.2 ships no training.** The `lora/` module is a loader stub + trajectory accumulator. Training is v1.5.
+- **v1.2 uses Qwen2.5-7B-Instruct** (64K via YaRN, native tool calling). Coder model: Qwen2.5-Coder-7B for implementation pass.
+- **64K context via YaRN** (verified). 128K fails — KV cache too large for 8GB VRAM + 16GB RAM.
+- **GPU requires CUDA 12.1 wheel** (v0.3.4). CPU wheel works as fallback.
+- **Deep pipeline takes 40-60 min** per query. Use `--fast` for quick queries.
+- **Dual model loading**: 8GB VRAM can't hold both models. Sequential load/unload.
+- **KV-cache reuse is best-effort.** v2 wires in real persistence.
+- **Self-critique adds latency**. Disable via `--no-critique`.
 
 ## v1.5 training (Kaggle free T4×2)
 
