@@ -32,16 +32,28 @@ class ModelSpec:
 
 
 _REGISTRY: dict[str, ModelSpec] = {
+    # Default: general-purpose instruct model with native tool calling support.
     "stock": ModelSpec(
         key="stock",
+        hf_repo="Qwen/Qwen2.5-7B-Instruct-GGUF",
+        hf_filename_template="qwen2.5-7b-instruct-{quant_lower}.gguf",
+        native_ctx=32_768,
+        params_b=7.0,
+        default_quant="Q4_K_M",
+        label="Qwen2.5-7B-Instruct (stock)",
+        is_ultres=False,
+        # sha256 pinned once the exact file is confirmed at install time.
+    ),
+    # Code-specific tasks: coding model for when the query is purely about code.
+    "coder": ModelSpec(
+        key="coder",
         hf_repo="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
         hf_filename_template="qwen2.5-coder-7b-instruct-{quant_lower}.gguf",
         native_ctx=32_768,
         params_b=7.0,
         default_quant="Q4_K_M",
-        label="Qwen2.5-Coder-7B-Instruct (stock)",
+        label="Qwen2.5-Coder-7B-Instruct (code-focused)",
         is_ultres=False,
-        # sha256 pinned once the exact file is confirmed at install time.
     ),
     # v1.5: populated when UltRes-Base-7B is published.
     "ultres-base": ModelSpec(

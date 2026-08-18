@@ -93,3 +93,36 @@ def lora_path_for_query(adapters_dir: Path, topic: str) -> str | None:
     """
     match = find_matching_adapter(adapters_dir, topic)
     return str(match.path) if match else None
+
+
+# ---------------------------------------------------------------------------
+# Trajectory accumulation for v1.5 QLoRA training
+# ---------------------------------------------------------------------------
+
+def list_trajectories(trajectories_dir: Path) -> list[dict[str, Any]]:
+    """List all saved research trajectories in .ultres/trajectories/.
+
+    Each trajectory is a JSONL file with (query, answer, steps, visited_urls,
+    doc_ids, code_ids). These become the training dataset for v1.5 QLoRA.
+    """
+    trajectories_dir = Path(trajectories_dir)
+    if not trajectories_dir.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for p in sorted(trajectories_dir.glob("*.jsonl")):
+        try:
+            import json as _json
+
+            record = _json.loads(p.read_text("utf-8").strip().splitlines()[0])
+            out.append(record)
+        except Exception:
+            continue
+    return out
+
+
+def trajectory_count(trajectories_dir: Path) -> int:
+    """Count saved trajectories (for display in CLI)."""
+    trajectories_dir = Path(trajectories_dir)
+    if not trajectories_dir.exists():
+        return 0
+    return len(list(trajectories_dir.glob("*.jsonl")))

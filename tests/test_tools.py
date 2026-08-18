@@ -22,10 +22,16 @@ def test_tool_schemas_well_formed():
         assert fn["parameters"]["type"] == "object"
 
 
-def test_system_prompt_mentions_all_tools():
+def test_system_prompt_mentions_workflow_tools():
+    """The system prompt should mention the key workflow tools.
+
+    With native tool calling, tool schemas are passed via the `tools` API
+    parameter, so the prompt doesn't need to list every tool — but it should
+    mention the core research workflow tools (search, visit, recall, finish).
+    """
     sp = system_prompt()
-    for name in tool_names():
-        assert name in sp
+    for name in ("search", "visit", "recall", "finish"):
+        assert name in sp, f"'{name}' not in system prompt"
 
 
 def test_extract_tool_call_native():

@@ -42,8 +42,9 @@ DEFAULT_MODEL_CACHE = USER_HOME_ULTRES / "models"
 class ModelConfig(BaseModel):
     """Which base model UltRes uses."""
 
-    # v1 only ships "stock". v1.5 adds "ultres-base", v2 adds "ultres-base-long".
-    selection: Literal["stock", "ultres-base", "ultres-base-long"] = "stock"
+    # v1.1: stock = Qwen2.5-7B-Instruct (general + tool calling), coder = Qwen2.5-Coder-7B.
+    # v1.5 adds "ultres-base", v2 adds "ultres-base-long".
+    selection: Literal["stock", "coder", "ultres-base", "ultres-base-long"] = "stock"
     quant: str = "Q4_K_M"
     # Override the auto-detected context window (tokens). None = use model default.
     n_ctx: int | None = None
@@ -76,6 +77,12 @@ class AgentConfig(BaseModel):
     temperature: float = 0.7
     # Temperature for the final reasoner call (slightly lower for coherence).
     final_temperature: float = 0.4
+    # Self-critique: after producing an answer, critique it against evidence
+    # and re-research gaps. 0 = disabled, 1 = one critique round (default).
+    enable_self_critique: bool = True
+    critique_rounds: int = 1
+    # Minimum pages to visit before finish is allowed.
+    min_visits_before_finish: int = 2
 
 
 class MemoryConfig(BaseModel):
@@ -195,7 +202,7 @@ class UltResConfig(BaseModel):
                 cfg.search.brave_api_key = api_key
 
         selection = os.environ.get("ULTRES_MODEL_SELECTION")
-        if selection in ("stock", "ultres-base", "ultres-base-long"):
+        if selection in ("stock", "coder", "ultres-base", "ultres-base-long"):
             cfg.model.selection = selection  # type: ignore[assignment]
 
         max_steps = os.environ.get("ULTRES_MAX_STEPS")

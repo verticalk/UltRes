@@ -1,0 +1,12 @@
+use_default_settings: true
+
+server:
+  limiter: false
+  public_instance: false
+  secret_key: "qaEhZInBnbyeiuYcZeKI4NMDgsApxdGI"
+  image_proxy: true
+
+search:
+  formats:
+    - html
+    - json

@@ -296,6 +296,141 @@ def _extract_tool_call(resp: dict[str, Any]) -> tuple[str | None, dict[str, Any]
     return None, {}, content
 
 
+def _synthesize_answer(
+    llm: Any,
+    executor: "ToolExecutor",
+    user_query: str,
+    draft_answer: str,
+    window: "HotWindow",
+    cfg: Any,
+) -> str:
+    """Synthesis pass: load recalled content and produce an evidence-cited answer.
+
+    Forces the model to ground its answer in retrieved content rather than
+    pretrained knowledge. If the draft already references doc_ids, keep it.
+    """
+    # Recall relevant content.
+    try:
+        recall_result = asyncio.run(executor._recall({"query": user_query, "k": 8}))
+    except Exception:
+        recall_result = "(recall failed)"
+
+    # Load top slices into the synthesis context.
+    synthesis_context = recall_result
+    # Try to load a few slices for grounding.
+    import re as _re
+
+    doc_ids = _re.findall(r"doc_id=([a-f0-9_]+)", recall_result)
+    for did in doc_ids[:3]:
+        try:
+            slice_text = executor.store.get_doc_slice(did)
+            if slice_text:
+                synthesis_context += f"\n\n--- Content from {did} ---\n"
+                synthesis_context += slice_text[:4000]
+        except Exception:
+            pass
+
+    synthesis_prompt = (
+        f"You are synthesizing a final answer for: {user_query}\n\n"
+        f"Draft answer: {draft_answer}\n\n"
+        f"Retrieved research:\n{synthesis_context[:12000]}\n\n"
+        f"Rewrite the answer to be detailed and grounded in the retrieved research. "
+        f"Reference specific facts from the content. If the draft is already well-grounded, "
+        f"you may keep it. Produce ONLY the final answer text (no tool call)."
+    )
+    try:
+        resp = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a precise research synthesizer."},
+                {"role": "user", "content": synthesis_prompt},
+            ],
+            temperature=cfg.agent.final_temperature,
+            max_tokens=2048,
+        )
+        synthesized = resp["choices"][0]["message"]["content"].strip()
+        if synthesized:
+            return synthesized
+    except Exception:
+        pass
+    return draft_answer
+
+
+def _self_critique(
+    llm: Any,
+    user_query: str,
+    answer: str,
+    recall_context: str,
+    cfg: Any,
+) -> tuple[str, list[str]]:
+    """Critique an answer against retrieved evidence.
+
+    Returns (critique_text, list_of_gap_queries).
+    If the critique finds gaps, the gap queries are used to re-enter research.
+    """
+    critique_prompt = (
+        f"You are critiquing a research answer for: {user_query}\n\n"
+        f"Answer: {answer}\n\n"
+        f"Available research evidence:\n{recall_context[:8000]}\n\n"
+        f"Identify any gaps, errors, or unsupported claims in the answer. "
+        f"If the answer is well-supported, say 'VERIFIED'. "
+        f"If there are gaps, list specific search queries that would fill them. "
+        f"Respond in this format:\n"
+        f"VERDICT: VERIFIED or NEEDS_MORE_RESEARCH\n"
+        f"GAPS: <comma-separated search queries, or empty if verified>\n"
+        f"NOTES: <brief explanation>"
+    )
+    try:
+        resp = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a rigorous research critic."},
+                {"role": "user", "content": critique_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=512,
+        )
+        text = resp["choices"][0]["message"]["content"].strip()
+        # Parse verdict + gaps.
+        gaps: list[str] = []
+        for line in text.splitlines():
+            if line.startswith("GAPS:"):
+                gap_str = line[5:].strip()
+                if gap_str and gap_str.lower() not in ("none", "empty", ""):
+                    gaps = [g.strip() for g in gap_str.split(",") if g.strip()]
+        return text, gaps
+    except Exception:
+        return "VERDICT: VERIFIED\nGAPS:\nNOTES: critique failed", []
+
+
+def _save_trajectory(
+    cfg: Any,
+    query_id: str,
+    user_query: str,
+    answer: str,
+    steps: int,
+    visited_urls: list[str],
+    doc_ids: list[str],
+    code_ids: list[str],
+) -> None:
+    """Save a research trajectory to .ultres/trajectories/ for v1.5 QLoRA training."""
+    import json as _json
+
+    traj_dir = cfg.ultres_dir / "trajectories"
+    traj_dir.mkdir(parents=True, exist_ok=True)
+    traj_path = traj_dir / f"{query_id}.jsonl"
+    record = {
+        "query_id": query_id,
+        "query": user_query,
+        "answer": answer,
+        "steps": steps,
+        "visited_urls": visited_urls,
+        "doc_ids": doc_ids,
+        "code_ids": code_ids,
+        "timestamp": time.time(),
+    }
+    with traj_path.open("w", encoding="utf-8") as f:
+        f.write(_json.dumps(record) + "\n")
+
+
 async def run_research_loop(
     llm: Any,
     cfg: Any,
@@ -373,18 +508,29 @@ async def run_research_loop(
             )
 
             # Ask the model for the next action.
-            # We use prompt-based tool calling (tools described in system prompt)
-            # rather than the native `tools` API parameter, because Qwen2.5
-            # doesn't reliably use native tool-calling with chatml format.
+            # Use native tool calling (Qwen2.5-7B-Instruct supports it).
+            # The _extract_tool_call fallback also parses JSON from content
+            # in case native tool_calls is empty.
             try:
                 resp = llm.create_chat_completion(
                     messages=window.messages,
+                    tools=TOOL_SCHEMAS,
+                    tool_choice="auto",
                     temperature=cfg.agent.temperature,
                     max_tokens=1024,
                 )
             except Exception as e:
-                window.append("assistant", f"(internal error: {e})")
-                continue
+                # Fallback: retry without tools (some models/chat formats
+                # don't support the tools parameter).
+                try:
+                    resp = llm.create_chat_completion(
+                        messages=window.messages,
+                        temperature=cfg.agent.temperature,
+                        max_tokens=1024,
+                    )
+                except Exception as e2:
+                    window.append("assistant", f"(internal error: {e2})")
+                    continue
 
             name, args, content = _extract_tool_call(resp)
             if content:
@@ -401,15 +547,21 @@ async def run_research_loop(
                 continue
 
             if name == "finish":
-                if len(visited_urls) < 2:
+                min_visits = cfg.agent.min_visits_before_finish
+                if len(visited_urls) < min_visits:
                     window.append(
                         "tool",
                         f"BLOCKED: You have visited {len(visited_urls)} pages. "
-                        "You MUST visit at least 2 pages before finishing. "
+                        f"You MUST visit at least {min_visits} pages before finishing. "
                         "Call visit(url) on a search result URL next.",
                     )
                     continue
-                answer = args.get("answer", content)
+                # Synthesis pass: force the model to produce an evidence-cited answer.
+                draft_answer = args.get("answer", content)
+                synthesized = _synthesize_answer(
+                    llm, executor, user_query, draft_answer, window, cfg
+                )
+                answer = synthesized
                 break
 
             # Block recall before any visits — the store is empty.
@@ -444,13 +596,59 @@ async def run_research_loop(
             try:
                 resp = llm.create_chat_completion(
                     messages=window.messages,
+                    tools=TOOL_SCHEMAS,
+                    tool_choice="auto",
                     temperature=cfg.agent.final_temperature,
                     max_tokens=2048,
                 )
                 _, fargs, fcontent = _extract_tool_call(resp)
-                answer = fargs.get("answer", fcontent)
+                draft = fargs.get("answer", fcontent)
+                synthesized = _synthesize_answer(
+                    llm, executor, user_query, draft, window, cfg
+                )
+                answer = synthesized
             except Exception:
                 answer = "(failed to produce a final answer)"
+
+    # --- Self-critique loop ---
+    if cfg.agent.enable_self_critique and answer:
+        for round_num in range(cfg.agent.critique_rounds):
+            console.print(f"[dim]Self-critique round {round_num + 1}/{cfg.agent.critique_rounds}...[/dim]")
+            # Get recall context for the critique.
+            try:
+                recall_ctx = await executor._recall({"query": user_query, "k": 8})
+            except Exception:
+                recall_ctx = "(recall failed)"
+            critique_text, gaps = _self_critique(
+                llm, user_query, answer, recall_ctx, cfg
+            )
+            if not gaps:
+                console.print(f"[green]Self-critique: answer verified.[/green]")
+                break
+            console.print(f"[yellow]Self-critique found gaps: {gaps}[/yellow]")
+            # Re-research the gaps with a few extra steps.
+            for gap_query in gaps[:3]:
+                console.print(f"[cyan]Re-researching gap: {gap_query}[/cyan]")
+                try:
+                    search_result = await executor._search({"query": gap_query, "n": 3})
+                    window.append("tool", search_result)
+                    # Auto-visit the first result.
+                    import re as _re
+
+                    url_match = _re.search(r"https?://\S+", search_result)
+                    if url_match:
+                        visit_result = await executor._visit({"url": url_match.group(0)})
+                        visited_urls.append(url_match.group(0))
+                        window.append("tool", visit_result)
+                except Exception as e:
+                    console.print(f"[red]Gap research error: {e}[/red]")
+            # Re-synthesize with the new content.
+            answer = _synthesize_answer(llm, executor, user_query, answer, window, cfg)
+
+    # --- Save trajectory for v1.5 QLoRA training ---
+    doc_ids = list(store.meta.docs.keys())
+    code_ids = list(store.meta.code.keys())
+    _save_trajectory(cfg, query_id, user_query, answer, steps, visited_urls, doc_ids, code_ids)
 
     # Persist answer.
     answer_path = cfg.answers_dir / f"{query_id}.md"

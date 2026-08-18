@@ -30,6 +30,11 @@ dependencies = [
 # llama-cpp-python compiles C++ from source and needs a toolchain (MSVC on
 # Windows, gcc/clang on Linux). Install with: pip install -e ".[inference]"
 inference = ["llama-cpp-python>=0.3.1"]
+# CUDA-accelerated inference (NVIDIA GPU). Uses prebuilt wheel — no compiler needed.
+# Install with: pip install -e ".[inference-cuda]"
+# Or directly: pip install llama-cpp-python==0.3.4 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 --force-reinstall --no-deps
+# Plus CUDA runtime: pip install nvidia-cuda-runtime-cu12==12.4.127 nvidia-cublas-cu12==12.4.5.8 nvidia-cuda-nvrtc-cu12==12.4.127
+inference-cuda = ["llama-cpp-python>=0.3.1"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
