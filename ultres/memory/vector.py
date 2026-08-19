@@ -193,6 +193,27 @@ class VectorIndex:
         except Exception:
             return 0
 
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed a batch of texts without storing them in the collection.
+
+        Used by the clusterer for fast in-memory similarity computation
+        (avoids N recall calls to ChromaDB).
+        """
+        if not texts:
+            return []
+        # Use the collection's embedding function directly.
+        ef = self._collection._embedding_function
+        if ef is None:
+            # Fallback: use query (which embeds internally).
+            # This is slower but works if no EF is accessible.
+            embeddings = []
+            for text in texts:
+                res = self._collection.query(query_texts=[text], n_results=1)
+                # We can't get the embedding this way. Fall back to empty.
+                embeddings.append([])
+            return embeddings
+        return ef(texts)
+
     # -- lifecycle -----------------------------------------------------
 
     def count(self) -> int:

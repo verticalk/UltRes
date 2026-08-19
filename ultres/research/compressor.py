@@ -96,7 +96,7 @@ def batch_summarize(
     Groups 5 clusters per model call to reduce total calls.
     Returns clusters with populated `summary` and `best_examples`.
     """
-    batch_size = 5
+    batch_size = 10  # v1.4: increased from 5 to halve model calls
     total_batches = (len(clusters) + batch_size - 1) // batch_size
 
     for batch_idx in range(total_batches):
