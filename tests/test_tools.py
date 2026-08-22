@@ -82,7 +82,7 @@ def test_extract_tool_call_no_tool():
     }
     name, args, content = _extract_tool_call(resp)
     assert name is None
-    assert "thinking" in content
+    assert "thinking" in content  # "thinking" as a word, not a tag
 
 
 def test_extract_tool_call_finish():

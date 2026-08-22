@@ -18,7 +18,7 @@ from typing import Any
 from rich.console import Console
 from rich.panel import Panel
 
-from ultres.agent.planner import plan_deep
+from ultres.agent.planner import plan_deep, plan_deep_iterative
 from ultres.agent.reasoner import two_pass_implement
 from ultres.memory.store import KnowledgeStore
 from ultres.memory.vector import VectorIndex
@@ -87,10 +87,17 @@ async def run_deep_research(
         llm = model_mgr.load_instruct()
 
         # =========================================================================
-        # Stage 1: Plan + Query Expansion
+        # Stage 1: Plan + Query Expansion (v1.6: iterative with coverage feedback)
         # =========================================================================
-        streamer.stage_start("plan", "Plan + Query Expansion")
-        plan_result = plan_deep(llm, user_query, temperature=cfg.agent.temperature)
+        streamer.stage_start("plan", "Plan + Query Expansion (iterative)")
+        try:
+            plan_result = await plan_deep_iterative(
+                llm, user_query, provider=provider,
+                temperature=cfg.agent.temperature,
+            )
+        except Exception:
+            # Fallback to non-iterative planning if the iterative version fails.
+            plan_result = plan_deep(llm, user_query, temperature=cfg.agent.temperature)
         queries = plan_result["expanded_queries"]
         query_type = plan_result["query_type"]
         streamer.stage_done("plan", {
@@ -157,7 +164,7 @@ async def run_deep_research(
         # Stage 3: Cluster Round 1
         # =========================================================================
         streamer.stage_start("cluster1", "Cluster Round 1")
-        clusters = cluster_pages(all_pages, index, threshold=dr.cluster_threshold)
+        clusters = cluster_pages(all_pages, index, threshold=dr.cluster_threshold, llm=llm)
         streamer.stage_done("cluster1", {
             "clusters": len(clusters),
         })
@@ -199,7 +206,7 @@ async def run_deep_research(
                 all_pages.extend(gap_crawl.pages)
                 all_urls.extend(gap_crawl.urls_fetched)
                 streamer.stage_start(f"recluster{gap_round+1}", f"Re-cluster Round {gap_round+1}")
-                clusters = cluster_pages(all_pages, index, threshold=dr.cluster_threshold)
+                clusters = cluster_pages(all_pages, index, threshold=dr.cluster_threshold, llm=llm)
                 streamer.stage_done(f"recluster{gap_round+1}", {
                     "clusters": len(clusters),
                 })
@@ -248,11 +255,13 @@ async def run_deep_research(
         })
 
         # =========================================================================
-        # Stage 9: Self-Critique (reload Instruct if Coder was used)
+        # Stage 9: Self-Critique
+        # v1.5: In single-model mode, the model is already loaded (no swap needed).
+        # Legacy: reload Instruct if Coder was used for Pass 2.
         # =========================================================================
         if cfg.agent.enable_self_critique and answer:
-            # Ensure Instruct is loaded for critique.
-            model_mgr.load_instruct()
+            if not getattr(model_mgr, "is_single_model", False):
+                model_mgr.load_instruct()
             llm = model_mgr.current()
             streamer.stage_start("critique", "Self-Critique")
             answer = _critique_and_refine(

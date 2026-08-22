@@ -95,7 +95,7 @@ def run(
     query: str = typer.Argument(..., help='The query, e.g. "build me a complex C++ calculator app"'),
     fast: bool = typer.Option(False, "--fast", help="Use fast agentic loop (30 steps) instead of deep pipeline"),
     search: Optional[str] = typer.Option(None, "--search", help="searxng|tavily|brave"),
-    model: Optional[str] = typer.Option(None, "--model", help="stock|coder|ultres-base|ultres-base-long"),
+    model: Optional[str] = typer.Option(None, "--model", help="stock|qwen25-7b|coder|ultres-base|ultres-base-long"),
     max_pages: Optional[int] = typer.Option(None, "--max-pages", help="Max pages to crawl (deep mode)"),
     no_critique: bool = typer.Option(False, "--no-critique", help="Skip self-critique"),
     no_stream: bool = typer.Option(False, "--no-stream", help="Disable live streaming"),
@@ -131,6 +131,8 @@ def run(
             f"Mode: {mode}\n"
             f"Model: {spec.label} ({cfg.model.quant})\n"
             f"Context: {cfg.model.extended_ctx if cfg.model.use_extended_context else spec.native_ctx} tokens\n"
+            f"GPU layers: {cfg.model.n_gpu_layers} | Flash attn: {'on' if cfg.model.flash_attn else 'off'} | KV: q4_0\n"
+            f"Thinking: {'on' if cfg.model.enable_thinking else 'off'}\n"
             f"Search: {cfg.search.backend}\n"
             f"RAM: {ram:.1f} GB | VRAM: {vram:.1f} GB\n"
             + (f"Max pages: {cfg.deep_research.max_pages}\n" if not fast else f"Max steps: {cfg.agent.max_steps}\n")
@@ -164,8 +166,8 @@ def run(
         from ultres.agent.research_loop import run_research_loop
         from ultres.agent.reasoner import stream_answer
 
-        console.print("[cyan]Loading model into llama.cpp...[/cyan]")
-        model_mgr = ModelManager(cfg)
+        console.print("[cyan]Loading model into llama.cpp (fast mode: 32K ctx, 55 GPU layers)...[/cyan]")
+        model_mgr = ModelManager(cfg, mode="fast")
         llm = model_mgr.load_instruct()
         console.print("[green]Model loaded.[/green]")
 
@@ -183,7 +185,7 @@ def run(
         from ultres.research.pipeline import run_deep_research
         from ultres.streaming import ResearchStreamer
 
-        model_mgr = ModelManager(cfg)
+        model_mgr = ModelManager(cfg, mode="deep")
 
         streamer = ResearchStreamer(console=console, enabled=cfg.deep_research.enable_streaming)
 
@@ -224,8 +226,8 @@ def main(
 
 @models_app.command("pull")
 def models_pull(
-    model: Optional[str] = typer.Option(None, "--model", help="stock|ultres-base|ultres-base-long"),
-    quant: Optional[str] = typer.Option(None, "--quant", help="Quantization, e.g. Q4_K_M"),
+    model: Optional[str] = typer.Option(None, "--model", help="stock|qwen25-7b|coder|ultres-base|ultres-base-long"),
+    quant: Optional[str] = typer.Option(None, "--quant", help="Quantization, e.g. UD-IQ2_XXS, Q4_K_M"),
 ):
     """Download the active (or specified) model."""
     cfg = UltResConfig.load()

@@ -105,16 +105,18 @@ def batch_summarize(
         batch = clusters[start:end]
 
         # Build the prompt with all clusters in the batch.
+        # v1.6: Increased page text sample from 1000→2000 chars and code
+        # from 500→1000 chars. We have 64K context now (not 32K), so we
+        # can afford to preserve more detail.
         cluster_descriptions = []
         for i, c in enumerate(batch):
-            # Use first 1000 chars of each page's text.
-            page_texts = [p.text[:1000] for p in c.pages[:5]]
-            code_texts = [cb.content[:500] for cb in c.code_blocks[:3]]
+            page_texts = [p.text[:2000] for p in c.pages[:5]]
+            code_texts = [cb.content[:1000] for cb in c.code_blocks[:3]]
             cluster_descriptions.append(
                 f"Cluster {start+i+1}: {c.name}\n"
                 f"  Pages: {len(c.pages)}, Code blocks: {len(c.code_blocks)}\n"
-                f"  Sample content:\n{' '.join(page_texts[:3])[:2000]}\n"
-                f"  Sample code:\n{' '.join(code_texts)[:1000]}"
+                f"  Sample content:\n{' '.join(page_texts[:3])[:3000]}\n"
+                f"  Sample code:\n{' '.join(code_texts)[:1500]}"
             )
 
         prompt = (
@@ -175,7 +177,7 @@ def hierarchical_compress(
     clusters: list[Cluster],
     llm: Any,
     user_query: str,
-    max_words: int = 5000,
+    max_words: int = 8000,
     streamer: ResearchStreamer | None = None,
 ) -> MasterBrief:
     """Compress cluster summaries into a structured master brief.
@@ -235,11 +237,14 @@ def hierarchical_compress(
         f"across {len(clusters)} clusters.\n\n"
         f"Write a structured brief with these sections:\n"
         f"## Overview\n(What the task is, key challenges)\n"
-        f"## Architecture Decisions\n(Recommended approach, with rationale from research)\n"
+        f"## Architecture Decisions\n(Recommended approach, with rationale from research. "
+        f"List each decision as a bullet with the rationale.)\n"
         f"## Key Algorithms & Patterns\n(From research, with references)\n"
+        f"## Code Patterns\n(The top 5 most useful code patterns/snippets found in research. "
+        f"Include the actual code inline, not just references.)\n"
         f"## Common Pitfalls\n(From research)\n"
         f"## Best Practices\n(From research)\n"
-        f"## Recommended Libraries & Tools\n(From research)\n\n"
+        f"## Recommended Libraries & Tools\n(From research, with specific versions if mentioned)\n\n"
         f"Keep the brief to ~{max_words} words. Be specific and cite research findings.\n\n"
         f"Topic summaries:\n{all_topic_sums[:20000]}"
     )
@@ -251,7 +256,7 @@ def hierarchical_compress(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
-            max_tokens=2000,
+            max_tokens=4096,  # v1.6: increased from 2000 for 8000-word briefs
         )
         brief_text = resp["choices"][0]["message"]["content"].strip()
     except Exception:

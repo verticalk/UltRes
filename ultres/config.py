@@ -42,17 +42,35 @@ DEFAULT_MODEL_CACHE = USER_HOME_ULTRES / "models"
 class ModelConfig(BaseModel):
     """Which base model UltRes uses."""
 
-    # v1.1: stock = Qwen2.5-7B-Instruct (general + tool calling), coder = Qwen2.5-Coder-7B.
-    # v1.5 adds "ultres-base", v2 adds "ultres-base-long".
-    selection: Literal["stock", "coder", "ultres-base", "ultres-base-long"] = "stock"
-    quant: str = "Q4_K_M"
+    # v1.5: stock = Qwen3.8-27B (single model for all stages, no swap).
+    # qwen25-7b/coder = legacy fast 7B models. ultres-base = v1.5 QLoRA checkpoint.
+    selection: Literal["stock", "qwen25-7b", "coder", "ultres-base", "ultres-base-long"] = "stock"
+    quant: str = "UD-IQ2_XXS"
     # Override the auto-detected context window (tokens). None = use model default.
     n_ctx: int | None = None
     # GPU layers to offload. -1 = all, 0 = CPU only.
-    n_gpu_layers: int = -1
+    # v1.5: 50 for Qwen3.8-27B on 8GB VRAM (50/65 layers on GPU).
+    # v1.6.1: 55 for fast mode (32K ctx frees VRAM), 50 for deep mode (65K ctx).
+    n_gpu_layers: int = 50
+    # v1.6.1: Fast mode context (research loop). 32K is sufficient for 28K hot window.
+    # Smaller ctx = less KV cache = more VRAM for model layers = faster generation.
+    fast_ctx: int = 32_768
+    # v1.6.1: Fast mode GPU layers (55/65 with 32K ctx + q4_0 KV).
+    fast_n_gpu_layers: int = 55
+    # v1.6.1: Deep mode context (bulk crawl pipeline). 48K is sufficient for 28K max prompt.
+    deep_ctx: int = 49_152
+    # v1.6.1: Deep mode GPU layers (52/65 with 48K ctx + q4_0 KV).
+    deep_n_gpu_layers: int = 52
     # v1.2: Extend context via YaRN rope scaling (32K → 64K).
     use_extended_context: bool = True
     extended_ctx: int = 65_536
+    # v1.5: Flash attention (enabled by default for Qwen3.8 hybrid attention).
+    flash_attn: bool = True
+    # v1.5: Quantized KV cache type (q4_0 = 2, saves ~75% KV memory).
+    # 0 = default (f16), 1 = q4_0 (legacy), 2 = q4_0, 8 = q8_0.
+    kv_cache_type: int = 2
+    # v1.5: Enable thinking mode (Qwen3.8 generates reasoning before answers).
+    enable_thinking: bool = True
 
 
 class SearchConfig(BaseModel):
@@ -72,7 +90,7 @@ class SearchConfig(BaseModel):
 class AgentConfig(BaseModel):
     """Research loop parameters."""
 
-    max_steps: int = 30
+    max_steps: int = 50
     # Soft token budget for the hot context window before eviction kicks in.
     # v1 default leaves headroom under the 32K native window.
     hot_window_token_budget: int = 28_000
@@ -85,7 +103,10 @@ class AgentConfig(BaseModel):
     enable_self_critique: bool = True
     critique_rounds: int = 1
     # Minimum pages to visit before finish is allowed.
-    min_visits_before_finish: int = 2
+    # v1.6.1: Increased from 2 to 5 — forces the model to research more
+    # thoroughly before answering. The old value of 2 was too low and caused
+    # shallow research with wrong answers.
+    min_visits_before_finish: int = 5
 
 
 class MemoryConfig(BaseModel):
@@ -241,7 +262,7 @@ class UltResConfig(BaseModel):
                 cfg.search.brave_api_key = api_key
 
         selection = os.environ.get("ULTRES_MODEL_SELECTION")
-        if selection in ("stock", "coder", "ultres-base", "ultres-base-long"):
+        if selection in ("stock", "qwen25-7b", "coder", "ultres-base", "ultres-base-long"):
             cfg.model.selection = selection  # type: ignore[assignment]
 
         max_steps = os.environ.get("ULTRES_MAX_STEPS")

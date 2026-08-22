@@ -131,6 +131,8 @@ def cluster_pages(
     pages: list[Page],
     index: VectorIndex,
     threshold: float = 0.7,
+    llm: Any = None,
+    enable_semantic_labels: bool = True,
 ) -> list[Cluster]:
     """Cluster pages by content similarity.
 
@@ -138,10 +140,16 @@ def cluster_pages(
     similarity, instead of N individual recall calls to ChromaDB. This is
     ~100x faster for 150+ pages.
 
+    v1.6: Adds adaptive cluster splitting (over-merged clusters are split
+    when internal similarity drops) and optional semantic labeling (uses
+    the model to generate meaningful cluster names instead of TF-IDF keywords).
+
     Args:
         pages: List of fetched pages.
         index: Vector index for embedding.
         threshold: Cosine similarity threshold for clustering.
+        llm: Optional model for semantic labeling (v1.6).
+        enable_semantic_labels: If True and llm provided, use model for labels.
 
     Returns:
         List of clusters.
@@ -181,6 +189,7 @@ def cluster_pages(
         # Create cluster.
         cluster_pages_list = [pages[idx] for idx in cluster_members]
         cluster_texts = [page_texts[idx] for idx in cluster_members]
+        cluster_embeddings = [embeddings[idx] for idx in cluster_members]
         label = _tfidf_labels(cluster_texts)
 
         # Collect code blocks.
@@ -201,6 +210,14 @@ def cluster_pages(
     # Merge clusters with very similar centroids (>0.95).
     # v1.4: Uses in-memory word overlap (no ChromaDB calls).
     clusters = _merge_similar_clusters(clusters, threshold=0.95)
+
+    # v1.6: Adaptive splitting — split clusters where internal similarity
+    # is too low (over-merged clusters with diverse content).
+    clusters = _split_overmerged_clusters(clusters, embeddings, pages, page_texts, threshold)
+
+    # v1.6: Semantic labeling — use the model to generate meaningful labels.
+    if enable_semantic_labels and llm is not None:
+        clusters = _semantic_label_clusters(clusters, llm)
 
     return clusters
 
@@ -276,3 +293,175 @@ def rank_code_examples(code_blocks: list[CodeBlock], max_per_cluster: int = 5) -
 
     ranked = sorted(code_blocks, key=code_quality, reverse=True)
     return ranked[:max_per_cluster]
+
+
+# ---------------------------------------------------------------------------
+# v1.6: Adaptive cluster splitting + semantic labeling
+# ---------------------------------------------------------------------------
+
+def _split_overmerged_clusters(
+    clusters: list[Cluster],
+    embeddings: list[list[float]],
+    pages: list[Page],
+    page_texts: list[str],
+    threshold: float,
+) -> list[Cluster]:
+    """Split clusters where internal pairwise similarity is too low.
+
+    v1.6: A cluster with 10+ pages but average pairwise similarity < 0.5
+    is likely over-merged (diverse content grouped by a broad keyword).
+    Re-cluster its members at a higher threshold (threshold + 0.1).
+    """
+    if not clusters:
+        return clusters
+
+    # Build a page-index -> embedding map for quick lookup.
+    # embeddings/page_texts are indexed by original page index.
+    # We need to find which original index each cluster page corresponds to.
+    # Since pages are passed by reference, we can use identity.
+    page_id_map: dict[int, int] = {}
+    for orig_idx, p in enumerate(pages):
+        page_id_map[id(p)] = orig_idx
+
+    result: list[Cluster] = []
+    for cluster in clusters:
+        if len(cluster.pages) < 10:
+            result.append(cluster)
+            continue
+
+        # Get embeddings for this cluster's pages.
+        cluster_emb_indices = []
+        for p in cluster.pages:
+            orig = page_id_map.get(id(p))
+            if orig is not None and orig < len(embeddings):
+                cluster_emb_indices.append(orig)
+
+        if len(cluster_emb_indices) < 10:
+            result.append(cluster)
+            continue
+
+        # Compute average pairwise similarity.
+        cluster_embs = [embeddings[i] for i in cluster_emb_indices]
+        total_sim = 0.0
+        n_pairs = 0
+        for i in range(len(cluster_embs)):
+            for j in range(i + 1, len(cluster_embs)):
+                total_sim += _cosine_similarity(cluster_embs[i], cluster_embs[j])
+                n_pairs += 1
+        avg_sim = total_sim / max(n_pairs, 1)
+
+        # If average similarity is low, re-cluster at a higher threshold.
+        if avg_sim < 0.5:
+            sub_threshold = min(threshold + 0.15, 0.9)
+            sub_clusters = _recluster_members(
+                cluster.pages, cluster_embs, sub_threshold,
+            )
+            for sub in sub_clusters:
+                sub_texts = [page_texts[page_id_map.get(id(p), 0)] for p in sub]
+                label = _tfidf_labels(sub_texts)
+                all_code: list[CodeBlock] = []
+                for p in sub:
+                    all_code.extend(p.code_blocks)
+                result.append(Cluster(
+                    cluster_id=f"{cluster.cluster_id}_sub",
+                    name=label,
+                    pages=sub,
+                    code_blocks=all_code,
+                    quality_score=_cluster_quality(sub, all_code),
+                    centroid_text=" ".join(sub_texts)[:500],
+                ))
+        else:
+            result.append(cluster)
+
+    return result
+
+
+def _recluster_members(
+    pages: list[Page],
+    embeddings: list[list[float]],
+    threshold: float,
+) -> list[list[Page]]:
+    """Re-cluster a set of pages at a higher threshold."""
+    assigned: set[int] = set()
+    sub_clusters: list[list[Page]] = []
+
+    for i in range(len(pages)):
+        if i in assigned:
+            continue
+        members: list[int] = [i]
+        assigned.add(i)
+        for j in range(i + 1, len(pages)):
+            if j in assigned:
+                continue
+            sim = _cosine_similarity(embeddings[i], embeddings[j])
+            if sim >= threshold:
+                members.append(j)
+                assigned.add(j)
+        sub_clusters.append([pages[idx] for idx in members])
+
+    return sub_clusters
+
+
+def _semantic_label_clusters(
+    clusters: list[Cluster],
+    llm: Any,
+    batch_size: int = 10,
+) -> list[Cluster]:
+    """Use the model to generate meaningful one-line labels for clusters.
+
+    v1.6: Replaces TF-IDF keyword labels (e.g., "qt signal slot event")
+    with semantic labels (e.g., "Qt signal-slot event handling patterns").
+
+    Processes clusters in batches of 10 to minimize model calls.
+    """
+    import json as _json
+    import re as _re
+
+    total_batches = (len(clusters) + batch_size - 1) // batch_size
+
+    for batch_idx in range(total_batches):
+        start = batch_idx * batch_size
+        end = min(start + batch_size, len(clusters))
+        batch = clusters[start:end]
+
+        # Build prompt with cluster info.
+        cluster_descs = []
+        for i, c in enumerate(batch):
+            # Use top TF-IDF words + sample page titles.
+            titles = [p.title[:60] for p in c.pages[:3]]
+            cluster_descs.append(
+                f"Cluster {start+i+1} ({len(c.pages)} pages, {len(c.code_blocks)} code blocks):\n"
+                f"  Keywords: {c.name}\n"
+                f"  Sample titles: {', '.join(titles)}"
+            )
+
+        prompt = (
+            f"Generate a concise, descriptive one-line label (5-10 words) for "
+            f"each of these {len(batch)} research clusters. The label should "
+            f"capture the TOPIC, not just keywords.\n\n"
+            + "\n\n".join(cluster_descs)
+            + "\n\nRespond with ONLY a JSON object:\n"
+            f'{{"labels": ["label 1", "label 2", ...]}}'
+        )
+
+        try:
+            resp = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": "You are a cluster labeling assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=512,
+            )
+            text = resp["choices"][0]["message"]["content"].strip()
+            m = _re.search(r"\{.*\}", text, _re.DOTALL)
+            if m:
+                data = _json.loads(m.group(0))
+                labels = data.get("labels", [])
+                for i, c in enumerate(batch):
+                    if i < len(labels) and labels[i].strip():
+                        c.name = labels[i].strip()
+        except Exception:
+            pass  # Keep TF-IDF labels on failure.
+
+    return clusters

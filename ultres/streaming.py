@@ -88,7 +88,7 @@ class ResearchStreamer:
         self._stage_map[name] = info
         self._current = info
         if self.enabled:
-            self.console.print(f"[cyan]▶ {label}...[/cyan]")
+            self.console.print(f"[cyan]> {label}...[/cyan]")
 
     def stage_progress(self, name: str, current: int, total: int, detail: str = "") -> None:
         """Update progress for a stage.
@@ -104,11 +104,8 @@ class ResearchStreamer:
         info.stats["detail"] = detail
         if self.enabled and total > 0:
             pct = current * 100 // total
-            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+            bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
             # Use a simple print with the progress info.
-            # We don't use \r because it conflicts with rich's Live display.
-            # Instead, print a dim progress line that gets overwritten by the
-            # next stage_done or stage_progress call.
             self.console.print(
                 f"  [dim]{bar} {current}/{total} {detail}[/dim]",
             )
@@ -126,8 +123,8 @@ class ResearchStreamer:
         if self.enabled:
             stat_str = " | ".join(f"{k}={v}" for k, v in (stats or {}).items())
             self.console.print(
-                f"[green]✓ {info.label}[/green] "
-                f"[dim][{info.elapsed_str}]{f' — {stat_str}' if stat_str else ''}[/dim]"
+                f"[green]OK {info.label}[/green] "
+                f"[dim][{info.elapsed_str}]{f' - {stat_str}' if stat_str else ''}[/dim]"
             )
 
     def token_stream(
@@ -190,11 +187,11 @@ class ResearchStreamer:
         self.console.print()
         self.console.print(Panel(
             "\n".join(
-                f"{'✓' if s.done else '○'} {s.label:40s} [{s.elapsed_str}]"
-                + (f" — {', '.join(f'{k}={v}' for k, v in s.stats.items() if k not in ('current', 'total', 'detail'))}"
+                f"{'OK' if s.done else '..'} {s.label:40s} [{s.elapsed_str}]"
+                + (f" - {', '.join(f'{k}={v}' for k, v in s.stats.items() if k not in ('current', 'total', 'detail'))}"
                    if any(k not in ('current', 'total', 'detail') for k in s.stats) else "")
                 for s in self.stages
-            ) + f"\n{'─' * 50}\nTotal elapsed: {self.total_elapsed_str}",
+            ) + f"\n{'-' * 50}\nTotal elapsed: {self.total_elapsed_str}",
             title="Pipeline Summary",
             border_style="cyan",
         ))

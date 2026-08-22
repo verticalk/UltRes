@@ -27,27 +27,28 @@ def _code_id(url: str, idx: int, content: str) -> str:
 
 
 def _extract_code_blocks_from_html(html: str, url: str) -> list[CodeBlock]:
-    """Pull `<pre><code>` blocks from raw HTML using a tolerant regex.
+    """Pull code blocks from raw HTML using tolerant regexes.
 
-    We don't depend on a full HTML parser here to stay robust against malformed
-    pages; trafilatura handles the main-text extraction separately.
+    v1.6: Now extracts from multiple sources:
+    1. <pre><code> blocks (original)
+    2. Bare <pre> blocks without <code> wrapper
+    3. Markdown code fences (```language ... ```) — for pages served as
+       markdown or rendered from it (GitHub READMEs, dev.to, etc.)
+    4. Stack Overflow answer cells (<div class="answercell"> code blocks)
     """
     blocks: list[CodeBlock] = []
-    # Match <pre ...><code ...> ... </code></pre> (and bare <pre>...</pre>).
-    pattern = re.compile(
-        r"<pre[^>]*>(?:\s*<code[^>]*>)?(.*?)(?:</code>\s*)?</pre>",
-        re.DOTALL | re.IGNORECASE,
-    )
-    for idx, m in enumerate(pattern.finditer(html)):
-        raw = m.group(0)
-        inner = m.group(1)
-        # Strip nested tags inside the code block.
-        text = re.sub(r"<[^>]+>", "", inner)
-        text = _html_unescape(text)
-        if not text.strip():
-            continue
-        lang_match = _LANG_RE.search(raw)
-        lang = lang_match.group(1).lower() if lang_match else None
+    seen_texts: set[str] = set()
+
+    def _add_block(idx: int, text: str, lang: str | None, raw: str) -> None:
+        text = text.strip()
+        if not text or len(text) < 10:
+            return
+        # Dedup by first 100 chars (avoid extracting the same code twice
+        # from <pre><code> and markdown fence).
+        key = text[:100]
+        if key in seen_texts:
+            return
+        seen_texts.add(key)
         blocks.append(
             CodeBlock(
                 code_id=_code_id(url, idx, text),
@@ -57,6 +58,46 @@ def _extract_code_blocks_from_html(html: str, url: str) -> list[CodeBlock]:
                 context="",
             )
         )
+
+    # 1. Match <pre ...><code ...> ... </code></pre> (and bare <pre>...</pre>).
+    pattern = re.compile(
+        r"<pre[^>]*>(?:\s*<code[^>]*>)?(.*?)(?:</code>\s*)?</pre>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    for idx, m in enumerate(pattern.finditer(html)):
+        raw = m.group(0)
+        inner = m.group(1)
+        text = re.sub(r"<[^>]+>", "", inner)
+        text = _html_unescape(text)
+        lang_match = _LANG_RE.search(raw)
+        lang = lang_match.group(1).lower() if lang_match else None
+        _add_block(idx, text, lang, raw)
+
+    # 2. v1.6: Extract markdown code fences from the extracted text.
+    # trafilatura outputs markdown, so code fences may be in the text.
+    # Also check raw HTML for markdown fences (some pages serve .md).
+    md_fence_re = re.compile(r"```(\w+)?\n(.*?)```", re.DOTALL)
+    for idx, m in enumerate(md_fence_re.finditer(html)):
+        lang = m.group(1).lower() if m.group(1) else None
+        text = _html_unescape(m.group(2).strip())
+        _add_block(idx + 1000, text, lang, m.group(0))
+
+    # 3. v1.6: Stack Overflow-specific extraction.
+    # SO answer code is in <div class="answercell"> ... <pre><code> blocks.
+    # The general <pre><code> extractor above already catches these,
+    # but SO sometimes uses <code> without <pre> for inline code in answers.
+    if "stackoverflow.com" in url or "stackexchange.com" in url:
+        # Extract from <code> tags within answer cells (not just <pre>).
+        so_pattern = re.compile(
+            r'<div[^>]*class="[^"]*answercell[^"]*"[^>]*>.*?<code[^>]*>(.*?)</code>',
+            re.DOTALL | re.IGNORECASE,
+        )
+        for idx, m in enumerate(so_pattern.finditer(html)):
+            text = re.sub(r"<[^>]+>", "", m.group(1))
+            text = _html_unescape(text).strip()
+            if len(text) > 20:  # Skip inline code snippets.
+                _add_block(idx + 2000, text, None, m.group(0))
+
     return blocks
 
 

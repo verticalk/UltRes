@@ -195,6 +195,7 @@ def score_page(page: Page, query: str, query_type: str) -> float:
     Factors:
     - Text length (longer = better, up to a cap)
     - Code block count (more = better for code queries)
+    - v1.6: Code density (ratio of code chars to text chars)
     - Has title
     - No fetch error
     - Keyword overlap with query
@@ -219,6 +220,15 @@ def score_page(page: Page, query: str, query_type: str) -> float:
             score += 0.3
         elif n_code >= 1:
             score += 0.15
+        # v1.6: Code density bonus — pages with high code-to-text ratio
+        # are more valuable for code queries.
+        total_code_chars = sum(len(cb.content) for cb in page.code_blocks)
+        if text_len > 0:
+            code_ratio = total_code_chars / text_len
+            if code_ratio > 0.3:
+                score += 0.1  # High code density bonus.
+            elif code_ratio > 0.1:
+                score += 0.05
     else:
         if n_code >= 1:
             score += 0.05

@@ -25,3 +25,10 @@ htmlcov/
 .vscode/
 .idea/
 *.swp
+
+# Debug / scratch output
+website_answer.md
+debug_*.py
+
+# Tool artifacts
+.freebuff/

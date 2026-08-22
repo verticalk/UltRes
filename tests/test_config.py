@@ -10,16 +10,21 @@ from ultres import __version__
 
 
 def test_version():
-    """Version should be 1.4.0 for this release."""
-    assert __version__ == "1.4.0"
+    """Version should be 1.6.0 for this release."""
+    assert __version__ == "1.6.0"
 
 
 def test_default_config(tmp_path: Path):
     cfg = UltResConfig(project_dir=tmp_path)
     assert cfg.model.selection == "stock"
     assert cfg.search.backend == "searxng"
-    assert cfg.agent.max_steps == 30
+    assert cfg.agent.max_steps == 50  # v1.6.1: increased from 30
     assert cfg.ultres_dir == tmp_path / ".ultres"
+    # v1.5: Qwen3.8-27B defaults.
+    assert cfg.model.flash_attn is True
+    assert cfg.model.kv_cache_type == 2  # q4_0
+    assert cfg.model.n_gpu_layers == 50
+    assert cfg.model.enable_thinking is True
 
 
 def test_save_and_load(tmp_path: Path):

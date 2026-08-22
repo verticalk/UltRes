@@ -2,13 +2,13 @@
 
 **UltRes** is a lightweight, locally-runnable AI that performs like a flagship model on a user's specific request by aggressively researching the web, building a disk-backed knowledge store for that exact task, and reasoning over it with a small agentic model — cheap, private, and dynamic.
 
-The base model is a custom fine-tuned + long-context-extended derivative of [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF) (Apache 2.0), built using only free GPU compute. v1.4 ships as a deep research pipeline wrapping the stock model with bulk crawling (httpx-first), gap detection, two-pass implementation, live streaming, and v1.5-ready trajectory export; v1.5/v2 add the custom UltRes checkpoints trained on accumulated agent trajectories.
+The base model is [Qwen3.8-27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (Apache 2.0), a 27B dense model with hybrid attention (16/64 full attention + 48 Gated DeltaNet linear attention) that fits 64K context in 8GB VRAM with q4_0 KV cache. v1.6 ships as a deep research pipeline with iterative planning, smarter code extraction, adaptive clustering, compile+test verification, HumanEval/MMLU benchmarking, and thinking-mode prompts; v1.5+/v2 add the custom UltRes checkpoints trained on accumulated agent trajectories.
 
 ## Why UltRes
 
 The core idea: instead of training a giant model on everything, use a small model that **researches the specific task on demand** and stores what it learns in a disk-backed knowledge store it can navigate via tool calls. This gives **effectively unlimited logical context** bounded only by disk — not by any fixed token limit — while running on a consumer laptop.
 
-This pattern is proven in 2026 by projects like [DR-Venus-4B](https://github.com/inclusionAI/DR-Venus) and [AgentCPM-Explore-4B](https://github.com/OpenBMB/AgentCPM), small on-device deep-research agents that entered GAIA/BrowseComp/HLE. UltRes wraps the same pattern around a 7B instruct model with native tool calling.
+This pattern is proven in 2026 by projects like [DR-Venus-4B](https://github.com/inclusionAI/DR-Venus) and [AgentCPM-Explore-4B](https://github.com/OpenBMB/AgentCPM), small on-device deep-research agents that entered GAIA/BrowseComp/HLE. UltRes wraps the same pattern around a 27B model with native tool calling and thinking mode.
 
 ## Install
 
@@ -24,11 +24,12 @@ playwright install chromium
 ### GPU acceleration (NVIDIA, recommended)
 
 ```bash
-pip install llama-cpp-python==0.3.4 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 --force-reinstall --no-deps
+# v1.5: cu125 wheel required (cu124 crashes with STATUS_ILLEGAL_INSTRUCTION).
+pip install llama-cpp-python==0.3.35 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu125 --force-reinstall --no-deps
 pip install nvidia-cuda-runtime-cu12==12.4.127 nvidia-cublas-cu12==12.4.5.8 nvidia-cuda-nvrtc-cu12==12.4.127
 ```
 
-This gives ~40+ tokens/sec on an RTX 4060 Ti 8GB (vs ~2-3 on CPU).
+This gives ~7.9 tokens/sec with Qwen3.8-27B on an RTX 4060 Ti 8GB (50/65 GPU layers, flash attn, q4_0 KV cache, 64K context). Legacy Qwen2.5-7B gives ~43.6 tokens/sec.
 
 ## Search backend setup
 
@@ -111,20 +112,40 @@ ultres trajectories validate      # check trajectory quality
 ultres trajectories show <id>     # show a single trajectory in detail
 ```
 
-## Hardware requirements (v1.4)
+### Benchmark evaluation (v1.6)
+
+```bash
+# HumanEval: pass@1 on coding problems (164 total)
+python -m ultres.eval --benchmark humaneval --n 20
+
+# MMLU: accuracy on multiple-choice knowledge questions
+python -m ultres.eval --benchmark mmlu --n 50
+
+# Direct generation (no research) for baseline comparison
+python -m ultres.eval --benchmark humaneval --n 20 --no-research
+
+# Save results to a specific file
+python -m ultres.eval --benchmark mmlu --n 100 -o results.json
+```
+
+Downloads HumanEval/MMLU datasets to `.ultres/eval_cache/` (cached for reuse).
+Scoring is fully automatic: HumanEval runs test cases in a sandboxed subprocess,
+MMLU compares the model's A/B/C/D answer to ground truth.
+
+## Hardware requirements (v1.6)
 
 - **CPU:** modern multi-core (tested on i7-13700K)
-- **RAM:** 16 GB minimum (model ~4.7 GB + KV cache for 64K context + OS)
-- **GPU:** NVIDIA with 8GB+ VRAM recommended. RTX 4060 Ti 8GB: 43.6 tok/s. CPU-only works at ~2-3 tok/s.
-- **Disk:** ~10 GB for both models + 100-200 MB per deep research query
+- **RAM:** 16 GB minimum (model ~6.8 GB + KV cache for 64K context + OS)
+- **GPU:** NVIDIA with 8GB+ VRAM recommended. RTX 4060 Ti 8GB: 7.9 tok/s (27B), 43.6 tok/s (legacy 7B). CPU-only works at ~1-2 tok/s.
+- **Disk:** ~7 GB for the 27B model + 100-200 MB per deep research query
 
 ## How "effectively unlimited context" works
 
-The 32K native context window (v1) / 256K (v2) is only the **hot working area**. The real context is the **disk-backed Knowledge Store**, which the model navigates via tool calls:
+The 64K context window is only the **hot working area**. The real context is the **disk-backed Knowledge Store**, which the model navigates via tool calls:
 
 | Tier | Where | What |
 |---|---|---|
-| Hot | GPU KV cache (32K/256K) | current reasoning slice: planner output + relevant chunks + working notes |
+| Hot | GPU KV cache (64K, q4_0) | current reasoning slice: planner output + relevant chunks + working notes |
 | Warm | Chroma vector index (disk) | embeddings of every retrieved page's notes + summaries; `recall(query)` pulls slices back into hot |
 | Cold | disk (raw pages) | full raw markdown of every fetched page; `load_slice(doc_id, section)` drills in |
 
@@ -139,10 +160,12 @@ This is the [MemGPT/Letta](https://github.com/cpacker/MemGPT) pattern + the DR-V
 
 | Phase | What | Compute |
 |---|---|---|
-| **v1.2** | Deep research pipeline: bulk crawl 2000+ pages, gap detection, two-pass Instruct→Coder implementation, live streaming, 64K YaRN context | Your hardware (no training) |
-| **v1.4** (this release) | Bug fixes, optimization, v1.5 readiness: ModelManager, httpx-first fetch, disk persistence, unified trajectories, training-ready export | Your hardware (no training) |
-| **v1.5** | QLoRA-specialize Qwen2.5-7B-Instruct on accumulated UltRes agent trajectories → `UltRes-Base-7B` | Kaggle free T4×2 (30 hrs/week) |
-| **v2** | Full fine-tune + YaRN long-context extension (64K→256K) → `UltRes-Base-7B-Long` + per-project LoRA cache training | Vultr $250 free A100 80GB credits (~68 hrs) |
+| **v1.2** | Deep research pipeline: bulk crawl 2000+ pages, gap detection, two-pass implementation, live streaming, 64K YaRN context | Your hardware (no training) |
+| **v1.4** | Bug fixes, optimization, v1.5 readiness: ModelManager, httpx-first fetch, disk persistence, unified trajectories, training-ready export | Your hardware (no training) |
+| **v1.5** | Qwen3.8-27B single-model upgrade, hybrid attention, q4_0 KV cache, thinking mode, clustering bottleneck fix | Your hardware (no training) |
+| **v1.6** (this release) | 10 pipeline improvements: iterative planner, smarter code extraction, adaptive clustering, compile+test verification, HumanEval/MMLU benchmark, query diversification, depth-aware gaps, adaptive tokens | Your hardware (no training) |
+| **v1.5+** | QLoRA-specialize Qwen3.8-27B on accumulated UltRes agent trajectories → `UltRes-Base-27B` | Kaggle free T4×2 (30 hrs/week) |
+| **v2** | Full fine-tune + YaRN long-context extension (64K→256K) → `UltRes-Base-27B-Long` + per-project LoRA cache training | Vultr $250 free A100 80GB credits (~68 hrs) |
 | Future | Continued pretraining; UltRes Lite (4B); shared adapter hub | NVIDIA Inception credits (optional) |
 
 See [the full plan](.devin/plans/) for architecture details and verification criteria.
@@ -186,4 +209,4 @@ ultres/
 
 ## License
 
-Apache 2.0 (matches the Qwen2.5 base model license).
+Apache 2.0 (matches the Qwen3.8 base model license).

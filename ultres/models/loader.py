@@ -284,6 +284,7 @@ def load_llama(
     cfg: UltResConfig,
     spec: ModelSpec | None = None,
     model_path: Path | None = None,
+    mode: str = "deep",
     **overrides: Any,
 ) -> "Any":
     """Initialize a llama-cpp-python `Llama` instance.
@@ -292,6 +293,11 @@ def load_llama(
     Context window defaults to the spec's native_ctx unless cfg.model.n_ctx is set.
     When cfg.model.use_extended_context is True and the spec supports YaRN,
     context is extended via rope scaling (32K → 64K).
+
+    v1.6.1: `mode` controls context size + GPU layers for speed:
+    - "fast": 32K context, 55 GPU layers (research loop — only needs 28K)
+    - "deep": 48K context, 52 GPU layers (deep pipeline — needs up to 28K)
+    - "full": 65K context, 50 GPU layers (maximum context, original behavior)
     """
     # Ensure CUDA DLL paths are available BEFORE importing llama_cpp,
     # because the import itself loads the shared library.
@@ -302,9 +308,13 @@ def load_llama(
         spec = spec or get_spec(cfg.model.selection)
         model_path = download_model(spec, cfg.model.quant, cfg.model_cache_dir)
 
-    # Determine context window.
+    # v1.6.1: Determine context window + GPU layers based on mode.
     if cfg.model.n_ctx:
         n_ctx = cfg.model.n_ctx
+    elif mode == "fast":
+        n_ctx = cfg.model.fast_ctx
+    elif mode == "deep":
+        n_ctx = cfg.model.deep_ctx
     elif spec and cfg.model.use_extended_context and spec.extended_ctx > 0:
         n_ctx = cfg.model.extended_ctx or spec.extended_ctx
     elif spec:
@@ -312,7 +322,15 @@ def load_llama(
     else:
         n_ctx = 32_768
 
-    n_gpu = overrides.pop("n_gpu_layers", cfg.model.n_gpu_layers)
+    # v1.6.1: GPU layers based on mode (unless explicitly overridden).
+    if "n_gpu_layers" in overrides:
+        n_gpu = overrides.pop("n_gpu_layers")
+    elif mode == "fast":
+        n_gpu = cfg.model.fast_n_gpu_layers
+    elif mode == "deep":
+        n_gpu = cfg.model.deep_n_gpu_layers
+    else:
+        n_gpu = cfg.model.n_gpu_layers
 
     kwargs: dict[str, Any] = {
         "model_path": str(model_path),
@@ -320,7 +338,24 @@ def load_llama(
         "n_gpu_layers": n_gpu,
         "n_threads": max(1, os.cpu_count() or 4),
         "verbose": False,
+        # v1.6.1: Inference speed optimizations (lossless).
+        "n_batch": 2048,          # Faster prompt processing (was default 512).
+        "n_ubatch": 512,          # Uniform batch size.
+        "n_threads_batch": max(1, os.cpu_count() or 4),  # All threads for batch.
+        "no_perf": True,          # Skip performance counter collection.
+        "offload_kqv": True,      # GPU-accelerated KV cache ops.
+        "use_mmap": True,         # Memory-mapped model loading (faster).
     }
+
+    # v1.5: Flash attention (enabled by default for Qwen3.8 hybrid attention).
+    if cfg.model.flash_attn:
+        kwargs["flash_attn"] = True
+
+    # v1.5: Quantized KV cache (q4_0 = type 2, saves ~75% KV memory).
+    # Essential for fitting 64K context in 8GB VRAM with a 27B model.
+    if cfg.model.kv_cache_type and cfg.model.kv_cache_type > 0:
+        kwargs["type_k"] = cfg.model.kv_cache_type
+        kwargs["type_v"] = cfg.model.kv_cache_type
 
     # YaRN rope scaling for extended context.
     if spec and cfg.model.use_extended_context and spec.extended_ctx > 0 and n_ctx > spec.native_ctx:
@@ -337,8 +372,8 @@ def load_llama(
 
         warnings.warn(
             "n_gpu_layers=-1 but no GPU detected. Model will run on CPU. "
-            "Install the CUDA wheel: pip install llama-cpp-python==0.3.4 "
-            "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 "
+            "Install the CUDA wheel: pip install llama-cpp-python==0.3.35 "
+            "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu125 "
             "--force-reinstall --no-deps",
             stacklevel=2,
         )
@@ -382,23 +417,34 @@ def unload_model(llm: Any) -> None:
 
 
 def load_coder_model(cfg: UltResConfig) -> "Any":
-    """Load the coder model (Qwen2.5-Coder-7B) for the implementation pass.
+    """Load the coder model for the implementation pass.
 
-    Downloads if needed. Uses the same YaRN extended context as the main model.
+    v1.5: With Qwen3.8-27B as the default, the "coder" is the same model —
+    no separate coder model is loaded. This function is kept for backward
+    compatibility but just loads the stock model.
     """
-    spec = get_spec(cfg.deep_research.coder_model)
+    spec = resolve_spec(cfg)
     model_path = download_model(spec, cfg.model.quant, cfg.model_cache_dir)
     return load_llama(cfg, spec=spec, model_path=model_path)
 
 
 class ModelManager:
-    """Manages sequential model loading/unloading for dual-model workflows.
+    """Manages model loading for the pipeline.
 
-    On 8GB VRAM, only one 7B model can be loaded at a time. This manager
-    ensures the correct model is loaded for each pipeline stage and the
-    previous model is unloaded before loading the next.
+    v1.5: With Qwen3.8-27B as the default, there is NO model swap — the same
+    27B model handles all stages (plan, summarize, implement, critique).
+    This is possible because the 27B is smart enough for both reasoning and
+    coding, eliminating the v1.2-v1.4 Instruct→Coder→Instruct swap cycle.
 
-    Usage:
+    For legacy 7B models, the dual-model swap behavior is preserved via
+    cfg.deep_research.coder_model.
+
+    Usage (v1.5 single-model):
+        mgr = ModelManager(cfg)
+        llm = mgr.load_instruct()   # all stages use this one model
+        mgr.unload_current()
+
+    Usage (legacy dual-model):
         mgr = ModelManager(cfg)
         llm = mgr.load_instruct()   # stages 1-7
         mgr.unload_current()
@@ -407,8 +453,9 @@ class ModelManager:
         llm = mgr.load_instruct()   # stage 9
     """
 
-    def __init__(self, cfg: UltResConfig):
+    def __init__(self, cfg: UltResConfig, mode: str = "deep"):
         self.cfg = cfg
+        self.mode = mode  # v1.6.1: "fast", "deep", or "full"
         self._current: Any = None
         self._current_key: str | None = None
         self._instruct_path: Path | None = None
@@ -416,8 +463,15 @@ class ModelManager:
         self._instruct_spec = None
         self._coder_spec = None
 
+    @property
+    def is_single_model(self) -> bool:
+        """True when using a single model for all stages (v1.5 Qwen3.8-27B)."""
+        # Single-model mode when the stock model is NOT a legacy 7B.
+        spec = resolve_spec(self.cfg)
+        return spec.params_b > 10.0  # 27B = single model; 7B = dual model
+
     def load_instruct(self) -> "Any":
-        """Load the Instruct model, unloading any currently loaded model first."""
+        """Load the Instruct (main) model, unloading any currently loaded model first."""
         if self._current_key == "instruct" and self._current is not None:
             return self._current
         self.unload_current()
@@ -426,12 +480,21 @@ class ModelManager:
             self._instruct_path = download_model(
                 self._instruct_spec, self.cfg.model.quant, self.cfg.model_cache_dir
             )
-        self._current = load_llama(self.cfg, spec=self._instruct_spec, model_path=self._instruct_path)
+        self._current = load_llama(self.cfg, spec=self._instruct_spec, model_path=self._instruct_path, mode=self.mode)
         self._current_key = "instruct"
         return self._current
 
     def load_coder(self) -> "Any":
-        """Load the Coder model, unloading any currently loaded model first."""
+        """Load the Coder model for the implementation pass.
+
+        v1.5: In single-model mode (Qwen3.8-27B), this returns the SAME model
+        that's already loaded — no swap needed. The 27B handles both planning
+        and coding.
+        """
+        # Single-model mode: just return the already-loaded instruct model.
+        if self.is_single_model:
+            return self.load_instruct()
+        # Legacy dual-model mode: load the separate coder model.
         if self._current_key == "coder" and self._current is not None:
             return self._current
         self.unload_current()
@@ -440,7 +503,7 @@ class ModelManager:
             self._coder_path = download_model(
                 self._coder_spec, self.cfg.model.quant, self.cfg.model_cache_dir
             )
-        self._current = load_llama(self.cfg, spec=self._coder_spec, model_path=self._coder_path)
+        self._current = load_llama(self.cfg, spec=self._coder_spec, model_path=self._coder_path, mode=self.mode)
         self._current_key = "coder"
         return self._current
 

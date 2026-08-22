@@ -34,19 +34,34 @@ class ModelSpec:
 
 
 _REGISTRY: dict[str, ModelSpec] = {
-    # Default: general-purpose instruct model with native tool calling support.
+    # v1.5 default: Qwen3.8-27B — single model for ALL stages (no swap).
+    # Hybrid attention (16/64 layers full attn, 48 Gated DeltaNet) means
+    # 64K context fits in 8GB VRAM with q4_0 KV cache.
+    # UD-IQ2_XXS quant (8.39 GB) + 50/65 GPU layers + 64K q4_0 KV = ~8 GB.
     "stock": ModelSpec(
         key="stock",
+        hf_repo="unsloth/Qwen3.8-27B-GGUF",
+        hf_filename_template="Qwen3.8-27B-UD-IQ2_XXS.gguf",
+        native_ctx=262_144,
+        params_b=27.0,
+        default_quant="UD-IQ2_XXS",
+        label="Qwen3.8-27B (stock)",
+        is_ultres=False,
+        extended_ctx=65_536,  # Use 64K (fits 8GB VRAM with q4_0 KV)
+    ),
+    # Legacy: Qwen2.5-7B-Instruct (v1.2-v1.4 default, faster but less capable).
+    "qwen25-7b": ModelSpec(
+        key="qwen25-7b",
         hf_repo="Qwen/Qwen2.5-7B-Instruct-GGUF",
         hf_filename_template="qwen2.5-7b-instruct-{quant_lower}.gguf",
         native_ctx=32_768,
         params_b=7.0,
         default_quant="Q4_K_M",
-        label="Qwen2.5-7B-Instruct (stock)",
+        label="Qwen2.5-7B-Instruct (legacy, fast)",
         is_ultres=False,
-        extended_ctx=65_536,  # YaRN 2x extension (verified working)
+        extended_ctx=65_536,
     ),
-    # Code-specific tasks: coding model for when the query is purely about code.
+    # Legacy: Qwen2.5-Coder-7B (v1.2-v1.4 coder model).
     "coder": ModelSpec(
         key="coder",
         hf_repo="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
@@ -54,7 +69,7 @@ _REGISTRY: dict[str, ModelSpec] = {
         native_ctx=32_768,
         params_b=7.0,
         default_quant="Q4_K_M",
-        label="Qwen2.5-Coder-7B-Instruct (code-focused)",
+        label="Qwen2.5-Coder-7B-Instruct (legacy, fast)",
         is_ultres=False,
         extended_ctx=65_536,
     ),

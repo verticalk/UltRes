@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -40,10 +41,17 @@ from ultres.search.base import SearchProvider, get_provider
 
 @dataclass
 class HotWindow:
-    """Manages the messages in the model's hot context with eviction."""
+    """Manages the messages in the model's hot context with eviction.
+
+    v1.6.1: Pins the first `pinned_count` messages (system prompt + initial
+    user message) so they are never evicted. This allows llama.cpp's internal
+    prefix KV cache to reuse the cached state for those messages across steps,
+    reducing prompt processing time for steps 2-N.
+    """
 
     budget: int  # soft token budget
     messages: list[dict[str, str]] = field(default_factory=list)
+    pinned_count: int = 2  # v1.6.1: system + initial user message are pinned
     _tokens: int = 0
 
     @staticmethod
@@ -62,11 +70,12 @@ class HotWindow:
     def _evict(self) -> None:
         """Evict oldest tool-result messages until under budget.
 
-        Always keeps the system prompt (index 0) and the last user message.
+        v1.6.1: Always keeps the pinned messages (first `pinned_count`) and
+        the last user message. This preserves the KV cache prefix.
         """
-        while self._tokens > self.budget and len(self.messages) > 3:
-            # Remove the oldest non-system message that isn't the last user turn.
-            for i in range(1, len(self.messages) - 1):
+        while self._tokens > self.budget and len(self.messages) > self.pinned_count + 2:
+            # Remove the oldest non-pinned message that isn't the last user turn.
+            for i in range(self.pinned_count, len(self.messages) - 1):
                 role = self.messages[i]["role"]
                 if role in ("tool", "assistant"):
                     removed = self.messages.pop(i)
@@ -140,8 +149,11 @@ class ToolExecutor:
             return f"visit error for {url}: {e}"
         if page.fetch_error and not page.text:
             return f"visit failed for {url}: {page.fetch_error}"
-        # Ingest into store + index.
-        info = build_tree(self.store, page, summarizer=self.summarizer)
+        # v1.6.1: Ingest into store with summarizer=None (lazy summarization).
+        # Summaries are batch-generated after the research loop completes,
+        # eliminating 2 model calls per visit (subtopic + topic summary).
+        # The recall() tool still searches extractive notes + raw text.
+        info = build_tree(self.store, page, summarizer=None)
         # Index notes + summaries + code snippets.
         notes = self.store.get_notes(info["doc_id"]) or {}
         self.index.add_note(
@@ -246,15 +258,27 @@ class LoopResult:
 def _extract_tool_call(resp: dict[str, Any]) -> tuple[str | None, dict[str, Any], str]:
     """Parse a model response into (tool_name, args, content_text).
 
-    Supports both native tool_calls and JSON-in-content fallback.
-    The JSON-in-content path handles:
-      - ```json ... ``` blocks
-      - Bare {"name": "...", "arguments": {...}} objects
-      - Objects with nested arguments dict
+    Supports multiple tool-call formats:
+    1. Native tool_calls (OpenAI-style) — tool_calls field in message
+    2. JSON in content — ```json ... ``` blocks or bare JSON objects
+    3. v1.6.1: Qwen3 XML format (inside or outside thinking blocks):
+       <function=name>\n<parameter=key>value</parameter>\n</function>
+
+    Also strips thinking tokens (...) from the returned content.
     """
     msg = resp["choices"][0]["message"]
-    content = msg.get("content") or ""
-    # Native tool_calls (OpenAI-style).
+    raw_content = msg.get("content") or ""
+
+    # v1.6.1: Strip Qwen3 thinking tokens from content for the window.
+    # Qwen3.8 generates thinking reasoning before the actual response.
+    # We keep thinking out of the hot window to avoid filling it with
+    # reasoning tokens that don't contribute to the tool call.
+    # The tags use angle brackets: ... 
+    content = re.sub(r"<think>.*?</think>\s*", "", raw_content, flags=re.DOTALL)
+    content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL)
+    content = content.strip()
+
+    # 1. Native tool_calls (OpenAI-style).
     tool_calls = msg.get("tool_calls") or []
     if tool_calls:
         tc = tool_calls[0]
@@ -266,10 +290,21 @@ def _extract_tool_call(resp: dict[str, Any]) -> tuple[str | None, dict[str, Any]
             args = {}
         return name, args, content
 
-    # Fallback: parse JSON from content.
-    import re
+    # 2. v1.6.1: Qwen3 XML format — search in BOTH raw and stripped content.
+    # The model outputs <function=name>...<parameter=key>value</parameter>...</function>
+    # This may be inside thinking blocks, so we search the raw content too.
+    xml_pattern = r"<function=(\w+)>(.*?)</function>"
+    for m in re.finditer(xml_pattern, raw_content, re.DOTALL):
+        name = m.group(1)
+        body = m.group(2)
+        # Parse <parameter=key>value</parameter> entries.
+        args: dict[str, Any] = {}
+        for pm in re.finditer(r"<parameter=(\w+)>(.*?)</parameter>", body, re.DOTALL):
+            args[pm.group(1)] = pm.group(2).strip()
+        if name:
+            return name, args, content
 
-    # Try ```json ... ``` block first.
+    # 3. JSON in content — ```json ... ``` blocks.
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     if m:
         try:
@@ -281,8 +316,7 @@ def _extract_tool_call(resp: dict[str, Any]) -> tuple[str | None, dict[str, Any]
         except json.JSONDecodeError:
             pass
 
-    # Try to find a JSON object with "name" in the content.
-    # Use a greedy approach: find all { ... } blocks and try to parse.
+    # 4. Bare JSON object with "name" in content.
     for m in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content, re.DOTALL):
         try:
             data = json.loads(m.group(0))
@@ -296,7 +330,7 @@ def _extract_tool_call(resp: dict[str, Any]) -> tuple[str | None, dict[str, Any]
     return None, {}, content
 
 
-def _synthesize_answer(
+async def _synthesize_answer(
     llm: Any,
     executor: "ToolExecutor",
     user_query: str,
@@ -306,12 +340,13 @@ def _synthesize_answer(
 ) -> str:
     """Synthesis pass: load recalled content and produce an evidence-cited answer.
 
+    v1.6.1: Now async (was sync with asyncio.run() that crashed inside a running loop).
     Forces the model to ground its answer in retrieved content rather than
     pretrained knowledge. If the draft already references doc_ids, keep it.
     """
     # Recall relevant content.
     try:
-        recall_result = asyncio.run(executor._recall({"query": user_query, "k": 8}))
+        recall_result = await executor._recall({"query": user_query, "k": 8})
     except Exception:
         recall_result = "(recall failed)"
 
@@ -499,6 +534,20 @@ async def run_research_loop(
         + "\n".join(f"- {s['query']}" for s in subtasks),
     )
 
+    # v1.6.1: Pre-warm the KV cache with the system prompt + tools.
+    # This makes a dummy call so llama.cpp caches the KV state for the
+    # system prompt + tool schemas. Subsequent calls with the same prefix
+    # will skip reprocessing those tokens.
+    try:
+        llm.create_chat_completion(
+            messages=[window.messages[0]],
+            tools=TOOL_SCHEMAS,
+            max_tokens=1,
+            temperature=0.0,
+        )
+    except Exception:
+        pass  # Warmup failure is non-critical.
+
     visited_urls: list[str] = []
     steps = 0
     max_steps = cfg.agent.max_steps
@@ -527,7 +576,7 @@ async def run_research_loop(
                     tools=TOOL_SCHEMAS,
                     tool_choice="auto",
                     temperature=cfg.agent.temperature,
-                    max_tokens=1024,
+                    max_tokens=4096,  # v1.6.1: increased for thinking tokens
                 )
             except Exception as e:
                 # Fallback: retry without tools (some models/chat formats
@@ -536,7 +585,7 @@ async def run_research_loop(
                     resp = llm.create_chat_completion(
                         messages=window.messages,
                         temperature=cfg.agent.temperature,
-                        max_tokens=1024,
+                        max_tokens=4096,
                     )
                 except Exception as e2:
                     window.append("assistant", f"(internal error: {e2})")
@@ -568,7 +617,7 @@ async def run_research_loop(
                     continue
                 # Synthesis pass: force the model to produce an evidence-cited answer.
                 draft_answer = args.get("answer", content)
-                synthesized = _synthesize_answer(
+                synthesized = await _synthesize_answer(
                     llm, executor, user_query, draft_answer, window, cfg
                 )
                 answer = synthesized
@@ -613,7 +662,7 @@ async def run_research_loop(
                 )
                 _, fargs, fcontent = _extract_tool_call(resp)
                 draft = fargs.get("answer", fcontent)
-                synthesized = _synthesize_answer(
+                synthesized = await _synthesize_answer(
                     llm, executor, user_query, draft, window, cfg
                 )
                 answer = synthesized
@@ -636,24 +685,32 @@ async def run_research_loop(
                 console.print(f"[green]Self-critique: answer verified.[/green]")
                 break
             console.print(f"[yellow]Self-critique found gaps: {gaps}[/yellow]")
-            # Re-research the gaps with a few extra steps.
-            for gap_query in gaps[:3]:
-                console.print(f"[cyan]Re-researching gap: {gap_query}[/cyan]")
-                try:
-                    search_result = await executor._search({"query": gap_query, "n": 3})
-                    window.append("tool", search_result)
-                    # Auto-visit the first result.
-                    import re as _re
+            # v1.6.1: Parallelize gap searches (was sequential).
+            gap_queries = gaps[:3]
+            console.print(f"[cyan]Re-researching {len(gap_queries)} gaps in parallel...[/cyan]")
+            import re as _re
 
-                    url_match = _re.search(r"https?://\S+", search_result)
-                    if url_match:
-                        visit_result = await executor._visit({"url": url_match.group(0)})
-                        visited_urls.append(url_match.group(0))
-                        window.append("tool", visit_result)
-                except Exception as e:
-                    console.print(f"[red]Gap research error: {e}[/red]")
+            search_tasks = [executor._search({"query": g, "n": 3}) for g in gap_queries]
+            search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+            # Visit the first result from each search in parallel.
+            visit_tasks = []
+            visit_queries = []
+            for i, sr in enumerate(search_results):
+                if isinstance(sr, Exception):
+                    continue
+                window.append("tool", sr)
+                url_match = _re.search(r"https?://\S+", sr)
+                if url_match:
+                    visit_tasks.append(executor._visit({"url": url_match.group(0)}))
+                    visit_queries.append(url_match.group(0))
+            if visit_tasks:
+                visit_results = await asyncio.gather(*visit_tasks, return_exceptions=True)
+                for i, vr in enumerate(visit_results):
+                    if isinstance(vr, str):
+                        visited_urls.append(visit_queries[i])
+                        window.append("tool", vr)
             # Re-synthesize with the new content.
-            answer = _synthesize_answer(llm, executor, user_query, answer, window, cfg)
+            answer = await _synthesize_answer(llm, executor, user_query, answer, window, cfg)
 
     # --- Save trajectory for v1.5 QLoRA training ---
     doc_ids = list(store.meta.docs.keys())
